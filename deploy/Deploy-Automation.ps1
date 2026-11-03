@@ -1,0 +1,542 @@
+#Requires -Version 7.4
+#Requires -Modules Az.Accounts, Az.Resources, Az.Automation, Az.Monitor, Microsoft.Graph.Authentication, Microsoft.Graph.Groups, Microsoft.Graph.Applications
+<#
+.SYNOPSIS
+    One-time deployment of the CorpiPhone directory sync: groups, Automation account, managed identity,
+    Graph permissions, PowerShell 7.4 runtime environment, runbooks, schedules and alerting.
+
+.DESCRIPTION
+    Run once from an admin workstation. Idempotent: every step checks for the resource before creating it,
+    so the script can be re-run after a partial failure or to pick up a new runbook version.
+
+    What it creates
+      1. Dynamic security group (default SG-CorpiPhone-Users) with rule (user.extensionAttribute1 -eq "CorpiPhone")
+         and the static exclusion group (default SG-Directory-Exclude).
+      2. Resource group and Automation account (Free plan) with a system-assigned managed identity.
+      3. Four Microsoft Graph application permissions on the identity:
+             DeviceManagementManagedDevices.Read.All, User.ReadWrite.All, GroupMember.Read.All, RoleManagement.Read.Directory
+         Deliberately NOT Contacts.ReadWrite. Microsoft documents that Entra grants and Exchange RBAC for Applications
+         grants are a union, so an unscoped Entra grant would defeat the mailbox scope created by New-ExchangeAppScope.ps1.
+      4. A PowerShell 7.4 runtime environment with the Microsoft.Graph submodules the runbooks need, pinned to
+         -GraphModuleVersion. The 7.2 runtime is .NET 6 and cannot load current Graph SDK modules.
+      5. Both runbooks imported and published into that runtime environment.
+      6. Schedules (daily 05:00 and weekly Monday 08:00 in -ScheduleTimeZone) linked to the runbooks with
+         WhatIf = $false. They are created disabled unless -EnableSchedules is passed; -DeferSchedules skips them.
+      7. An action group and an Azure Monitor metric alert that emails -AlertEmail when a job ends Failed or Suspended.
+
+    What it does NOT do
+      - It does not touch Exchange Online. Run deploy/New-ExchangeAppScope.ps1 next with the two ids this script prints.
+      - It does not create Intune policies. Run deploy/New-OutlookContactSyncPolicies.ps1 for those.
+
+.PARAMETER SubscriptionId
+    Azure subscription that hosts the Automation account.
+.PARAMETER ResourceGroupName
+    Resource group to create or reuse.
+.PARAMETER Location
+    Azure region for the resource group and Automation account, for example eastus2.
+.PARAMETER AutomationAccountName
+    Name of the Automation account to create or reuse.
+.PARAMETER AlertEmail
+    Address that receives the Failed/Suspended job alert.
+.PARAMETER ControlGroupName
+    Display name of the dynamic security group that Runbook 1 fills through the stamp. Default SG-CorpiPhone-Users.
+.PARAMETER ExclusionGroupName
+    Display name of the static group whose members receive contacts but are not listed. Default SG-Directory-Exclude.
+.PARAMETER ScopeAttributeName
+    Extension attribute used as the stamp. Default extensionAttribute1. If you change it, also change the constant
+    at the top of runbooks/Sync-IntuneToEntra.ps1 and the -ScopeAttributeName of New-ExchangeAppScope.ps1.
+.PARAMETER ScopeAttributeValue
+    Value written to the stamp attribute. Default CorpiPhone.
+.PARAMETER GraphModuleVersion
+    Microsoft.Graph SDK version pinned into the runtime environment. 2.40.0 is known to load on the 7.4 runtime;
+    2.41.0 and 2.41.1 are known to fail. Before changing it, check the PowerShell Gallery and the Azure Automation
+    release notes for the newest version confirmed to load in Automation 7.4, and test in a second runtime environment.
+.PARAMETER RuntimeEnvironmentName
+    Name of the PowerShell 7.4 runtime environment. Default PowerShell74-GraphSync.
+.PARAMETER ScheduleTimeZone
+    IANA time zone for the schedules. Default America/New_York.
+.PARAMETER RunbookDirectory
+    Folder that holds Sync-IntuneToEntra.ps1 and Sync-DirectoryToMailboxes.ps1. Default ../runbooks relative to this script.
+.PARAMETER DeferSchedules
+    Skip creating and linking schedules entirely.
+.PARAMETER EnableSchedules
+    Create the schedules enabled. Without this they are created (and linked) but disabled, so nothing runs
+    until you enable them in step 6 of the deployment guide.
+
+.EXAMPLE
+    ./Deploy-Automation.ps1 -SubscriptionId 00000000-0000-0000-0000-000000000000 -ResourceGroupName rg-corpiphone-sync `
+        -Location eastus2 -AutomationAccountName aa-corpiphone-sync -AlertEmail it-alerts@contoso.com
+
+.NOTES
+    Requires: Owner or Contributor on the subscription, Global Administrator or Privileged Role Administrator
+    (for the Graph app role assignments) and Groups Administrator (or Global Administrator) for the groups.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)] [string]$SubscriptionId,
+    [Parameter(Mandatory)] [string]$ResourceGroupName,
+    [Parameter(Mandatory)] [string]$Location,
+    [Parameter(Mandatory)] [string]$AutomationAccountName,
+    [Parameter(Mandatory)] [string]$AlertEmail,
+    [string]$ControlGroupName = 'SG-CorpiPhone-Users',
+    [string]$ExclusionGroupName = 'SG-Directory-Exclude',
+    [string]$ScopeAttributeName = 'extensionAttribute1',
+    [string]$ScopeAttributeValue = 'CorpiPhone',
+    [string]$GraphModuleVersion = '2.40.0',
+    [string]$RuntimeEnvironmentName = 'PowerShell74-GraphSync',
+    [string]$ScheduleTimeZone = 'America/New_York',
+    [string]$RunbookDirectory = (Join-Path $PSScriptRoot '..' 'runbooks'),
+    [switch]$DeferSchedules,
+    [switch]$EnableSchedules
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ----------------------------------------------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------------------------------------------
+$GraphAppId = '00000003-0000-0000-c000-000000000000'
+$RequiredGraphPermissions = @(
+    'DeviceManagementManagedDevices.Read.All',
+    'User.ReadWrite.All',
+    'GroupMember.Read.All',
+    'RoleManagement.Read.Directory'
+)
+# Modules imported into the runtime environment. Authentication must be first; the others depend on it.
+$GraphModules = @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Users',
+    'Microsoft.Graph.Groups',
+    'Microsoft.Graph.DeviceManagement',
+    'Microsoft.Graph.PersonalContacts'
+)
+$Runbooks = @(
+    @{ Name = 'Sync-IntuneToEntra'; Description = 'Stamps corporate iPhone primary users and writes their numbers to mobilePhone.' },
+    @{ Name = 'Sync-DirectoryToMailboxes'; Description = 'Writes one Company Directory contact per coworker into each stamped mailbox.' }
+)
+$AutomationApiVersion = '2023-05-15-preview'
+$AlertActionGroupName = "$AutomationAccountName-failed-jobs"
+$AlertRuleName = "$AutomationAccountName-job-failed-or-suspended"
+
+# ----------------------------------------------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------------------------------------------
+function Write-Step {
+    param([string]$Message)
+    Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $Message) -ForegroundColor Cyan
+}
+
+function Get-ArmToken {
+    # Az.Accounts 2.x returns a plain string token; 4.x/5.x return a SecureString. Handle both.
+    $t = Get-AzAccessToken -ResourceUrl 'https://management.azure.com/'
+    if ($t.Token -is [securestring]) {
+        return [System.Net.NetworkCredential]::new('', $t.Token).Password
+    }
+    return [string]$t.Token
+}
+
+function Invoke-Arm {
+    <#
+        Thin wrapper over Invoke-AzRestMethod that throws on non-2xx and returns the parsed JSON body (or $null).
+    #>
+    param(
+        [Parameter(Mandatory)] [ValidateSet('GET', 'PUT', 'POST', 'PATCH', 'DELETE')] [string]$Method,
+        [Parameter(Mandatory)] [string]$Path,
+        [object]$Body
+    )
+    $restArgs = @{ Method = $Method; Path = $Path }
+    if ($null -ne $Body) { $restArgs.Payload = ($Body | ConvertTo-Json -Depth 20) }
+    $resp = Invoke-AzRestMethod @restArgs
+    if ($resp.StatusCode -ge 400) {
+        throw "ARM $Method $Path failed with $($resp.StatusCode): $($resp.Content)"
+    }
+    if ([string]::IsNullOrWhiteSpace($resp.Content)) { return $null }
+    return ($resp.Content | ConvertFrom-Json -Depth 20)
+}
+
+function Get-ArmOrNull {
+    param([Parameter(Mandatory)] [string]$Path)
+    $resp = Invoke-AzRestMethod -Method GET -Path $Path
+    if ($resp.StatusCode -eq 404) { return $null }
+    if ($resp.StatusCode -ge 400) { throw "ARM GET $Path failed with $($resp.StatusCode): $($resp.Content)" }
+    return ($resp.Content | ConvertFrom-Json -Depth 20)
+}
+
+function Get-NextOccurrence {
+    <#
+        Returns the next wall-clock occurrence of $Hour:00 in $TimeZoneId (optionally on $DayOfWeek) as a UTC DateTimeOffset
+        at least 15 minutes in the future, which is what New-AzAutomationSchedule requires.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$TimeZoneId,
+        [Parameter(Mandatory)] [int]$Hour,
+        [System.DayOfWeek]$DayOfWeek
+    )
+    $tz = [TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
+    $nowLocal = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+    $candidate = [DateTime]::new($nowLocal.Year, $nowLocal.Month, $nowLocal.Day, $Hour, 0, 0, [DateTimeKind]::Unspecified)
+    while (($candidate -le $nowLocal.AddMinutes(15)) -or ($PSBoundParameters.ContainsKey('DayOfWeek') -and $candidate.DayOfWeek -ne $DayOfWeek)) {
+        $candidate = $candidate.AddDays(1)
+    }
+    $utc = [TimeZoneInfo]::ConvertTimeToUtc($candidate, $tz)
+    return [DateTimeOffset]::new($utc, [TimeSpan]::Zero)
+}
+
+function Wait-ForCondition {
+    param(
+        [Parameter(Mandatory)] [scriptblock]$Condition,
+        [Parameter(Mandatory)] [string]$Description,
+        [int]$TimeoutSeconds = 600,
+        [int]$IntervalSeconds = 10
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $result = & $Condition
+        if ($result) { return $result }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+    throw "Timed out after $TimeoutSeconds seconds waiting for: $Description"
+}
+
+# ----------------------------------------------------------------------------------------------------------------
+# 0. Preflight
+# ----------------------------------------------------------------------------------------------------------------
+foreach ($rb in $Runbooks) {
+    $path = Join-Path $RunbookDirectory "$($rb.Name).ps1"
+    if (-not (Test-Path $path)) { throw "Runbook file not found: $path" }
+    $rb.Path = (Resolve-Path $path).Path
+}
+
+Write-Step "Connecting to Azure subscription $SubscriptionId"
+$null = Connect-AzAccount -Subscription $SubscriptionId
+$null = Set-AzContext -Subscription $SubscriptionId
+
+Write-Step 'Connecting to Microsoft Graph (Group.ReadWrite.All, AppRoleAssignment.ReadWrite.All, Application.Read.All)'
+Connect-MgGraph -Scopes 'Group.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'Application.Read.All' -NoWelcome
+
+# ----------------------------------------------------------------------------------------------------------------
+# 1. Groups
+# ----------------------------------------------------------------------------------------------------------------
+Write-Step "Ensuring dynamic group '$ControlGroupName'"
+$membershipRule = "(user.$ScopeAttributeName -eq `"$ScopeAttributeValue`")"
+$controlGroup = Get-MgGroup -Filter "displayName eq '$ControlGroupName'" -Property Id, DisplayName, GroupTypes, MembershipRule | Select-Object -First 1
+if (-not $controlGroup) {
+    $controlGroup = New-MgGroup -DisplayName $ControlGroupName `
+        -Description "Corporate iPhone holders. Filled automatically by the Sync-IntuneToEntra runbook through $ScopeAttributeName. Do not edit by hand." `
+        -MailEnabled:$false -MailNickname ($ControlGroupName -replace '[^A-Za-z0-9]', '') -SecurityEnabled `
+        -GroupTypes @('DynamicMembership') -MembershipRule $membershipRule -MembershipRuleProcessingState 'On'
+    Write-Host "  created $($controlGroup.Id)"
+}
+else {
+    if ($controlGroup.GroupTypes -notcontains 'DynamicMembership') {
+        throw "Group '$ControlGroupName' exists but is not a dynamic group. Rename or delete it, or pass a different -ControlGroupName."
+    }
+    if ($controlGroup.MembershipRule -ne $membershipRule) {
+        Write-Warning "Group '$ControlGroupName' has rule [$($controlGroup.MembershipRule)] but the expected rule is [$membershipRule]. Fix it in Entra if that is unintended."
+    }
+    Write-Host "  exists $($controlGroup.Id)"
+}
+
+Write-Step "Ensuring static exclusion group '$ExclusionGroupName'"
+$exclusionGroup = Get-MgGroup -Filter "displayName eq '$ExclusionGroupName'" -Property Id, DisplayName | Select-Object -First 1
+if (-not $exclusionGroup) {
+    $exclusionGroup = New-MgGroup -DisplayName $ExclusionGroupName `
+        -Description 'Members receive Company Directory contacts but are not listed in the directory, and their phone number is not written to mobilePhone.' `
+        -MailEnabled:$false -MailNickname ($ExclusionGroupName -replace '[^A-Za-z0-9]', '') -SecurityEnabled
+    Write-Host "  created $($exclusionGroup.Id)"
+}
+else {
+    Write-Host "  exists $($exclusionGroup.Id)"
+}
+
+# ----------------------------------------------------------------------------------------------------------------
+# 2. Resource group, Automation account, managed identity
+# ----------------------------------------------------------------------------------------------------------------
+Write-Step "Ensuring resource group '$ResourceGroupName' in $Location"
+if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
+    $null = New-AzResourceGroup -Name $ResourceGroupName -Location $Location
+    Write-Host '  created'
+}
+else { Write-Host '  exists' }
+
+Write-Step "Ensuring Automation account '$AutomationAccountName' (Free plan, system-assigned identity)"
+$aa = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
+if (-not $aa) {
+    $aa = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -Location $Location -Plan Free -AssignSystemIdentity
+    Write-Host '  created'
+}
+elseif (-not $aa.Identity -or -not $aa.Identity.PrincipalId) {
+    $aa = Set-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -AssignSystemIdentity
+    Write-Host '  exists, enabled system-assigned identity'
+}
+else { Write-Host '  exists' }
+
+$identityObjectId = $aa.Identity.PrincipalId
+if (-not $identityObjectId) {
+    # Set-AzAutomationAccount sometimes returns before the identity is populated; re-read.
+    $aa = Wait-ForCondition -Description 'managed identity to appear on the Automation account' -TimeoutSeconds 120 -Condition {
+        $a = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName
+        if ($a.Identity -and $a.Identity.PrincipalId) { $a } else { $null }
+    }
+    $identityObjectId = $aa.Identity.PrincipalId
+}
+
+Write-Step "Waiting for the identity's service principal $identityObjectId to appear in Entra"
+$identitySp = Wait-ForCondition -Description 'managed identity service principal in Microsoft Graph' -TimeoutSeconds 300 -Condition {
+    Get-MgServicePrincipal -ServicePrincipalId $identityObjectId -ErrorAction SilentlyContinue
+}
+$identityAppId = $identitySp.AppId
+Write-Host "  application id $identityAppId, object id $identityObjectId"
+
+# ----------------------------------------------------------------------------------------------------------------
+# 3. Graph application permissions (app role assignments on the Microsoft Graph service principal)
+# ----------------------------------------------------------------------------------------------------------------
+Write-Step 'Granting Graph application permissions to the identity'
+$graphSp = Get-MgServicePrincipal -Filter "appId eq '$GraphAppId'" -Property Id, AppRoles | Select-Object -First 1
+if (-not $graphSp) { throw 'Microsoft Graph service principal not found in the tenant.' }
+$existingAssignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $identityObjectId -All)
+
+foreach ($permission in $RequiredGraphPermissions) {
+    $role = $graphSp.AppRoles | Where-Object { $_.Value -eq $permission -and $_.AllowedMemberTypes -contains 'Application' } | Select-Object -First 1
+    if (-not $role) { throw "Graph app role '$permission' not found on the Microsoft Graph service principal." }
+    if ($existingAssignments | Where-Object { $_.AppRoleId -eq $role.Id -and $_.ResourceId -eq $graphSp.Id }) {
+        Write-Host "  exists  $permission"
+        continue
+    }
+    $null = New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $identityObjectId -PrincipalId $identityObjectId -ResourceId $graphSp.Id -AppRoleId $role.Id
+    Write-Host "  granted $permission"
+}
+
+# Guard: the identity must not hold any Contacts.* Graph permission, or the Exchange RBAC scope is defeated.
+$contactsRoles = $graphSp.AppRoles | Where-Object { $_.Value -like 'Contacts.*' }
+$badAssignments = $existingAssignments | Where-Object { $_.ResourceId -eq $graphSp.Id -and $_.AppRoleId -in $contactsRoles.Id }
+if ($badAssignments) {
+    foreach ($bad in $badAssignments) {
+        $value = ($contactsRoles | Where-Object { $_.Id -eq $bad.AppRoleId }).Value
+        Write-Warning "The identity holds Graph permission '$value' in Entra. This is an UNSCOPED grant and makes the Exchange mailbox scope meaningless."
+        Write-Warning "  Remove it with: Remove-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $identityObjectId -AppRoleAssignmentId $($bad.Id)"
+    }
+}
+else { Write-Host '  verified: no Contacts.* permission on the identity (contacts access comes only from Exchange RBAC)' }
+
+# ----------------------------------------------------------------------------------------------------------------
+# 4. PowerShell 7.4 runtime environment with pinned Microsoft.Graph modules
+# ----------------------------------------------------------------------------------------------------------------
+$aaPath = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName"
+$rtPath = "$aaPath/runtimeEnvironments/$RuntimeEnvironmentName"
+
+Write-Step "Ensuring PowerShell 7.4 runtime environment '$RuntimeEnvironmentName'"
+$rt = Get-ArmOrNull -Path "$rtPath`?api-version=$AutomationApiVersion"
+if (-not $rt) {
+    $null = Invoke-Arm -Method PUT -Path "$rtPath`?api-version=$AutomationApiVersion" -Body @{
+        location   = $Location
+        properties = @{
+            runtime         = @{ language = 'PowerShell'; version = '7.4' }
+            defaultPackages = @{}
+            description     = "PowerShell 7.4 with Microsoft.Graph $GraphModuleVersion for the CorpiPhone directory sync runbooks."
+        }
+    }
+    Write-Host '  created'
+}
+else {
+    $rtVersion = $rt.properties.runtime.version
+    if ($rtVersion -ne '7.4') { throw "Runtime environment '$RuntimeEnvironmentName' exists but is PowerShell $rtVersion, not 7.4. Pass a different -RuntimeEnvironmentName." }
+    Write-Host '  exists'
+}
+
+Write-Step "Adding Microsoft.Graph $GraphModuleVersion modules to the runtime environment (each waits until imported)"
+foreach ($module in $GraphModules) {
+    $pkgPath = "$rtPath/packages/$module`?api-version=$AutomationApiVersion"
+    $pkg = Get-ArmOrNull -Path $pkgPath
+    $currentVersion = if ($pkg) { $pkg.properties.version } else { $null }
+    $state = if ($pkg) { $pkg.properties.provisioningState } else { $null }
+    if ($pkg -and $currentVersion -eq $GraphModuleVersion -and $state -eq 'Succeeded') {
+        Write-Host "  exists  $module $currentVersion"
+        continue
+    }
+    $null = Invoke-Arm -Method PUT -Path $pkgPath -Body @{
+        properties = @{
+            contentLink = @{ uri = "https://www.powershellgallery.com/api/v2/package/$module/$GraphModuleVersion" }
+        }
+    }
+    $final = Wait-ForCondition -Description "$module $GraphModuleVersion import" -TimeoutSeconds 900 -IntervalSeconds 15 -Condition {
+        $p = Get-ArmOrNull -Path $pkgPath
+        if ($p -and $p.properties.provisioningState -in @('Succeeded', 'Failed')) { $p } else { $null }
+    }
+    if ($final.properties.provisioningState -ne 'Succeeded') {
+        throw "Module $module $GraphModuleVersion failed to import into the runtime environment: $($final.properties | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    Write-Host "  imported $module $GraphModuleVersion"
+}
+
+# ----------------------------------------------------------------------------------------------------------------
+# 5. Runbooks: create (in the runtime environment), upload draft content, publish
+# ----------------------------------------------------------------------------------------------------------------
+Write-Step 'Importing and publishing runbooks'
+$armToken = Get-ArmToken
+foreach ($rb in $Runbooks) {
+    $rbPath = "$aaPath/runbooks/$($rb.Name)"
+    $existing = Get-ArmOrNull -Path "$rbPath`?api-version=$AutomationApiVersion"
+    if (-not $existing) {
+        $null = Invoke-Arm -Method PUT -Path "$rbPath`?api-version=$AutomationApiVersion" -Body @{
+            location   = $Location
+            properties = @{
+                runbookType        = 'PowerShell'
+                runtimeEnvironment = $RuntimeEnvironmentName
+                logProgress        = $false
+                logVerbose         = $false
+                description        = $rb.Description
+                draft              = @{}
+            }
+        }
+        Write-Host "  created   $($rb.Name)"
+    }
+    elseif ($existing.properties.runtimeEnvironment -ne $RuntimeEnvironmentName) {
+        $null = Invoke-Arm -Method PATCH -Path "$rbPath`?api-version=$AutomationApiVersion" -Body @{
+            properties = @{ runtimeEnvironment = $RuntimeEnvironmentName }
+        }
+        Write-Host "  moved     $($rb.Name) to runtime environment $RuntimeEnvironmentName"
+    }
+
+    $content = Get-Content -Path $rb.Path -Raw
+    $contentUri = "https://management.azure.com$rbPath/draft/content?api-version=$AutomationApiVersion"
+    $null = Invoke-RestMethod -Method Put -Uri $contentUri -ContentType 'text/powershell' -Body $content -Headers @{ Authorization = "Bearer $armToken" }
+
+    # The content upload is asynchronous; publish only once the draft reflects the uploaded script.
+    $null = Wait-ForCondition -Description "$($rb.Name) draft content upload" -TimeoutSeconds 180 -IntervalSeconds 5 -Condition {
+        try {
+            $draft = Invoke-RestMethod -Method Get -Uri $contentUri -Headers @{ Authorization = "Bearer $armToken" }
+            if (($draft -is [string]) -and ($draft.Trim() -eq $content.Trim())) { $true } else { $null }
+        }
+        catch { $null }
+    }
+    $null = Invoke-Arm -Method POST -Path "$rbPath/publish?api-version=$AutomationApiVersion"
+    $null = Wait-ForCondition -Description "$($rb.Name) publish" -TimeoutSeconds 180 -IntervalSeconds 5 -Condition {
+        $r = Get-ArmOrNull -Path "$rbPath`?api-version=$AutomationApiVersion"
+        if ($r -and $r.properties.state -eq 'Published') { $r } else { $null }
+    }
+    Write-Host "  published $($rb.Name)"
+}
+
+# ----------------------------------------------------------------------------------------------------------------
+# 6. Schedules
+# ----------------------------------------------------------------------------------------------------------------
+if ($DeferSchedules) {
+    Write-Step 'Skipping schedules (-DeferSchedules)'
+}
+else {
+    Write-Step "Ensuring schedules in $ScheduleTimeZone (daily 05:00 for Sync-IntuneToEntra, Monday 08:00 for Sync-DirectoryToMailboxes)"
+    $scheduleDefinitions = @(
+        @{
+            Name       = 'Sync-IntuneToEntra-Daily-0500'
+            Runbook    = 'Sync-IntuneToEntra'
+            StartTime  = (Get-NextOccurrence -TimeZoneId $ScheduleTimeZone -Hour 5)
+            Weekly     = $false
+            Parameters = @{
+                WhatIf              = $false
+                ExclusionGroupName  = $ExclusionGroupName
+                DefaultCountryCode  = '+1'
+                ScopeAttributeValue = $ScopeAttributeValue
+            }
+        },
+        @{
+            Name       = 'Sync-DirectoryToMailboxes-Weekly-Mon-0800'
+            Runbook    = 'Sync-DirectoryToMailboxes'
+            StartTime  = (Get-NextOccurrence -TimeZoneId $ScheduleTimeZone -Hour 8 -DayOfWeek Monday)
+            Weekly     = $true
+            Parameters = @{
+                WhatIf             = $false
+                GroupName          = $ControlGroupName
+                ExclusionGroupName = $ExclusionGroupName
+                UserPrincipalName  = ''
+                FullRebuild        = $false
+            }
+        }
+    )
+
+    foreach ($def in $scheduleDefinitions) {
+        $schedule = Get-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name -ErrorAction SilentlyContinue
+        if (-not $schedule) {
+            if ($def.Weekly) {
+                $schedule = New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name `
+                    -StartTime $def.StartTime -WeekInterval 1 -DaysOfWeek Monday -TimeZone $ScheduleTimeZone
+            }
+            else {
+                $schedule = New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name `
+                    -StartTime $def.StartTime -DayInterval 1 -TimeZone $ScheduleTimeZone
+            }
+            Write-Host "  created schedule $($def.Name) (first run $($def.StartTime.ToString('u')))"
+        }
+        else { Write-Host "  exists  schedule $($def.Name)" }
+
+        $link = Get-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
+            -RunbookName $def.Runbook -ScheduleName $def.Name -ErrorAction SilentlyContinue
+        if (-not $link) {
+            $null = Register-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
+                -RunbookName $def.Runbook -ScheduleName $def.Name -Parameters $def.Parameters
+            Write-Host "  linked  $($def.Name) -> $($def.Runbook) with WhatIf=false"
+        }
+        else { Write-Host "  linked  $($def.Name) -> $($def.Runbook) (already)" }
+
+        $null = Set-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name -IsEnabled $EnableSchedules.IsPresent
+    }
+    if ($EnableSchedules) { Write-Host '  schedules ENABLED' } else { Write-Host '  schedules created DISABLED. Enable them after the pilot (deployment guide step 6) or re-run with -EnableSchedules.' }
+}
+
+# ----------------------------------------------------------------------------------------------------------------
+# 7. Alerting: action group + metric alert on job status Failed or Suspended
+# ----------------------------------------------------------------------------------------------------------------
+Write-Step "Ensuring action group '$AlertActionGroupName' emailing $AlertEmail"
+$actionGroup = Get-AzActionGroup -ResourceGroupName $ResourceGroupName -Name $AlertActionGroupName -ErrorAction SilentlyContinue
+if (-not $actionGroup) {
+    $shortName = ($AutomationAccountName -replace '[^A-Za-z0-9]', '')
+    if ($shortName.Length -gt 12) { $shortName = $shortName.Substring(0, 12) }
+    if (Get-Command -Name New-AzActionGroupEmailReceiverObject -ErrorAction SilentlyContinue) {
+        # Az.Monitor 5.x and later
+        $receiver = New-AzActionGroupEmailReceiverObject -Name 'ops-email' -EmailAddress $AlertEmail
+        $actionGroup = New-AzActionGroup -ResourceGroupName $ResourceGroupName -Name $AlertActionGroupName -ShortName $shortName -Location 'Global' -EmailReceiver $receiver
+    }
+    else {
+        # Az.Monitor 4.x and earlier
+        $receiver = New-AzActionGroupReceiver -Name 'ops-email' -EmailReceiver -EmailAddress $AlertEmail
+        $actionGroup = Set-AzActionGroup -ResourceGroupName $ResourceGroupName -Name $AlertActionGroupName -ShortName $shortName -Receiver $receiver
+    }
+    Write-Host '  created'
+}
+else { Write-Host '  exists' }
+
+Write-Step "Ensuring metric alert '$AlertRuleName' (TotalJob where Status in Failed, Suspended)"
+$dimension = New-AzMetricAlertRuleV2DimensionSelection -DimensionName 'Status' -ValuesToInclude 'Failed', 'Suspended'
+$criteria = New-AzMetricAlertRuleV2Criteria -MetricName 'TotalJob' -MetricNamespace 'Microsoft.Automation/automationAccounts' `
+    -DimensionSelection $dimension -TimeAggregation Total -Operator GreaterThan -Threshold 0
+$null = Add-AzMetricAlertRuleV2 -Name $AlertRuleName -ResourceGroupName $ResourceGroupName -Severity 2 `
+    -WindowSize ([TimeSpan]::FromHours(1)) -Frequency ([TimeSpan]::FromMinutes(15)) `
+    -TargetResourceId $aa.AutomationAccountId -Condition $criteria -ActionGroupId $actionGroup.Id `
+    -Description 'A CorpiPhone directory sync runbook job ended Failed or Suspended.'
+Write-Host '  upserted'
+
+# ----------------------------------------------------------------------------------------------------------------
+# Done
+# ----------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '================================================================================' -ForegroundColor Green
+Write-Host ' Deployment complete. Values for deploy/New-ExchangeAppScope.ps1:' -ForegroundColor Green
+Write-Host "   -ApplicationId $identityAppId"
+Write-Host "   -ObjectId      $identityObjectId"
+Write-Host ''
+Write-Host ' Next steps'
+Write-Host "   1. Run New-ExchangeAppScope.ps1 with the two ids above (Exchange Administrator)."
+Write-Host "   2. Start the Sync-IntuneToEntra runbook with WhatIf = true and review the stamp list."
+Write-Host "   3. Confirm in Entra > Enterprise applications that the identity shows exactly: $($RequiredGraphPermissions -join ', ')"
+Write-Host '================================================================================' -ForegroundColor Green
+
+[pscustomobject]@{
+    IdentityApplicationId = $identityAppId
+    IdentityObjectId      = $identityObjectId
+    ControlGroupId        = $controlGroup.Id
+    ExclusionGroupId      = $exclusionGroup.Id
+    AutomationAccountId   = $aa.AutomationAccountId
+    RuntimeEnvironment    = $RuntimeEnvironmentName
+    GraphModuleVersion    = $GraphModuleVersion
+}

@@ -1,0 +1,7 @@
+# Local tooling output
+TestResults*.xml
+*.log
+.vscode/
+# Never commit tenant-specific files
+*.local.ps1
+*.local.psd1

@@ -24,6 +24,7 @@ Intune managedDevice (primary user, phoneNumber)
 | `deploy/New-ExchangeAppScope.ps1` | One-time, Exchange Administrator: service principal, management scope, scoped `Application Contacts.ReadWrite`, authorization test, Entra permission check. |
 | `deploy/New-OutlookContactSyncPolicies.ps1` | One-time, Intune Administrator: iOS APP and Outlook ACP, assigned to a group. |
 | `deploy/sandbox/` | Windows Sandbox bootstrap (paste-and-go PowerShell 5.1 script) and a `.wsb` that runs it at logon. |
+| `docs/Deployment-Guide-for-First-Timers.md` | Step-by-step deployment guide for someone who has never used Azure, Intune or PowerShell. Every click and command spelled out. |
 | `tests/` | Pester tests (pure functions, full runbook flows against an in-memory fake Graph, PSScriptAnalyzer). |
 | `PSScriptAnalyzerSettings.psd1` | Lint settings used by the tests. |
 

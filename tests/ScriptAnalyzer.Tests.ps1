@@ -75,7 +75,8 @@ Describe 'Repository hygiene' {
         $allowed = @(
             'b4b9c0a1-5f0e-4c3d-9a7e-2d6f1c8e0a11',   # extended property namespace (fixed by design)
             '00000003-0000-0000-c000-000000000000',   # Microsoft Graph well-known app id
-            '00000000-0000-0000-0000-000000000000'    # placeholder in examples
+            '00000000-0000-0000-0000-000000000000',   # placeholder in examples
+            '1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d'    # obviously fake example id used in the beginner guide
         )
         $files = Get-ChildItem -Path $root -Recurse -Include '*.ps1', '*.psd1', '*.md' | Where-Object { $_.FullName -notmatch '[\\/]tests[\\/]' -and $_.FullName -notmatch '[\\/]\.git[\\/]' }
         $offenders = foreach ($f in $files) {

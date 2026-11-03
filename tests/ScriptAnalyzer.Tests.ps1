@@ -87,3 +87,52 @@ Describe 'Repository hygiene' {
         @($offenders) | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Windows Sandbox bootstrap script' {
+    BeforeAll {
+        $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+        $sandbox = Join-Path $root 'deploy' 'sandbox' 'Initialize-SandboxEnvironment.ps1'
+        $text = Get-Content -Path $sandbox -Raw
+    }
+
+    It 'parses and uses only syntax Windows PowerShell 5.1 understands' {
+        $errors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile($sandbox, [ref]$null, [ref]$errors)
+        @($errors).Count | Should -Be 0
+        $compat = @(Invoke-ScriptAnalyzer -Path $sandbox -Settings @{
+                Rules = @{ PSUseCompatibleSyntax = @{ Enable = $true; TargetVersions = @('5.1', '7.0') } }
+            } -IncludeRule PSUseCompatibleSyntax)
+        $compat.Count | Should -Be 0 -Because (($compat | ForEach-Object { "line $($_.Line): $($_.Message)" }) -join "`n")
+    }
+
+    It 'has no errors or warnings beyond Write-Host and plural nouns' {
+        $findings = @(Invoke-ScriptAnalyzer -Path $sandbox -Severity Error, Warning -ExcludeRule PSAvoidUsingWriteHost, PSUseSingularNouns)
+        $findings.Count | Should -Be 0 -Because (($findings | ForEach-Object { "[$($_.Severity)] $($_.RuleName) line $($_.Line): $($_.Message)" }) -join "`n")
+    }
+
+    It 'is paste-safe: no #Requires, no Break or Return at script scope, no PowerShell 7 operators' {
+        $text | Should -Not -Match '(?m)^#Requires'
+        $text | Should -Not -Match '\?\?'
+        $text | Should -Not -Match '\?\.\w'
+        $text | Should -Not -Match '\s&&\s'
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($sandbox, [ref]$null, [ref]$null)
+        $topLevel = $ast.EndBlock.Statements
+        foreach ($st in $topLevel) {
+            $st.FindAll({ param($n) ($n -is [System.Management.Automation.Language.BreakStatementAst] -or $n -is [System.Management.Automation.Language.ReturnStatementAst]) -and
+                    -not ($n.Parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+                    ($n.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) -eq $null) }, $false) |
+                Where-Object { $_.Extent.StartLineNumber -gt 0 } |
+                ForEach-Object {
+                    # Any Break/Return found directly under a top-level statement that is not itself a function definition
+                    if ($st -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $_.Extent.Text | Should -BeNullOrEmpty -Because 'Break/Return at script scope kills a pasted script' }
+                }
+        }
+    }
+
+    It 'pins the same Graph module version the deploy script defaults to' {
+        $deploy = Get-Content -Path (Join-Path $root 'deploy' 'Deploy-Automation.ps1') -Raw
+        $deploy -match "\[string\]\`$GraphModuleVersion = '([0-9.]+)'" | Should -BeTrue
+        $deployVersion = $Matches[1]
+        $text | Should -Match ([regex]::Escape("`$GraphModuleVersion = '$deployVersion'"))
+    }
+}

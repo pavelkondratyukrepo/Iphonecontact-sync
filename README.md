@@ -23,6 +23,7 @@ Intune managedDevice (primary user, phoneNumber)
 | `deploy/Deploy-Automation.ps1` | One-time: groups, Automation account, identity, Graph permissions, 7.4 runtime environment with pinned modules, runbooks, schedules, alert. |
 | `deploy/New-ExchangeAppScope.ps1` | One-time, Exchange Administrator: service principal, management scope, scoped `Application Contacts.ReadWrite`, authorization test, Entra permission check. |
 | `deploy/New-OutlookContactSyncPolicies.ps1` | One-time, Intune Administrator: iOS APP and Outlook ACP, assigned to a group. |
+| `deploy/sandbox/` | Windows Sandbox bootstrap (paste-and-go PowerShell 5.1 script) and a `.wsb` that runs it at logon. |
 | `tests/` | Pester tests (pure functions, full runbook flows against an in-memory fake Graph, PSScriptAnalyzer). |
 | `PSScriptAnalyzerSettings.psd1` | Lint settings used by the tests. |
 
@@ -38,6 +39,14 @@ Follow the Deployment guide for the hands-on steps. The order is dictated by the
 4. `deploy/New-OutlookContactSyncPolicies.ps1` creates the APP and ACP and assigns them to a pilot group, later to `SG-CorpiPhone-Users`.
 5. Runbook 2 `Sync-DirectoryToMailboxes`, first with `WhatIf = true` and `UserPrincipalName` for one pilot user, then live.
 6. Enable the schedules: Runbook 1 daily 05:00, Runbook 2 weekly Monday 08:00 (America/New_York). The three-hour gap lets Exchange's permission cache catch up for users stamped that morning.
+
+### Running from Windows Sandbox
+
+Windows Sandbox starts clean every time (PowerShell 5.1 only, no modules, no cached account). `deploy/sandbox/Initialize-SandboxEnvironment.ps1` turns it into a ready admin workstation: paste the whole file into the Windows PowerShell window the Sandbox opens. It installs PowerShell 7.4 and Git, clones this repo, installs the exact module set into PowerShell 7 (Graph pinned to the runtime environment's version), disables broker sign-in, runs the Pester suite and opens a PowerShell 7 window in the repo. About 10 to 15 minutes. Edit the configuration block at the top first if the branch name or repo URL changed.
+
+To automate it, copy the script into a host folder, point `deploy/sandbox/CorpiPhone-Sync.wsb` at that folder and double-click the `.wsb`; the Sandbox runs the setup at logon.
+
+Inside Sandbox, run every deploy script with `-UseDeviceCode`. There is no cached Microsoft account for the broker flow, so the scripts show a code you enter at microsoft.com/devicelogin in a browser on the host. Without the switch they try the interactive flow first and fall back to device code when it fails.
 
 ### Test locally before touching the tenant
 

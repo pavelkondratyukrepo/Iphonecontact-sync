@@ -36,6 +36,9 @@
     if you have one, so this script edits it instead of stacking a second policy.
 .PARAMETER AppConfigurationPolicyName
     Display name of the managed-apps ACP to create or update.
+.PARAMETER UseDeviceCode
+    Sign in to Graph with a device code (Windows Sandbox, no cached account). Without it the script tries the
+    interactive flow first and falls back to device code when it fails.
 
 .EXAMPLE
     ./New-OutlookContactSyncPolicies.ps1 -GroupName 'SG-CorpiPhone-Pilot'
@@ -51,7 +54,8 @@
 param(
     [Parameter(Mandatory)] [string]$GroupName,
     [string]$AppProtectionPolicyName = 'iOS APP - Outlook (Intune managed devices)',
-    [string]$AppConfigurationPolicyName = 'ACP - Outlook contact sync (iOS and Android)'
+    [string]$AppConfigurationPolicyName = 'ACP - Outlook contact sync (iOS and Android)',
+    [switch]$UseDeviceCode
 )
 
 Set-StrictMode -Version Latest
@@ -199,8 +203,16 @@ function Add-PolicyGroupAssignment {
 }
 
 # ----------------------------------------------------------------------------------------------------------------
-Write-Step 'Connecting to Microsoft Graph (DeviceManagementApps.ReadWrite.All, Group.Read.All)'
-Connect-MgGraph -Scopes 'DeviceManagementApps.ReadWrite.All', 'Group.Read.All' -NoWelcome
+Write-Step "Connecting to Microsoft Graph (DeviceManagementApps.ReadWrite.All, Group.Read.All)$(if ($UseDeviceCode) { ' (device code)' })"
+$scopes = @('DeviceManagementApps.ReadWrite.All', 'Group.Read.All')
+if ($UseDeviceCode) { Connect-MgGraph -Scopes $scopes -UseDeviceCode -NoWelcome -ErrorAction Stop }
+else {
+    try { Connect-MgGraph -Scopes $scopes -NoWelcome -ErrorAction Stop }
+    catch {
+        Write-Warning "Interactive Graph sign-in failed ($($_.Exception.Message)). Falling back to device code, which is expected inside Windows Sandbox."
+        Connect-MgGraph -Scopes $scopes -UseDeviceCode -NoWelcome -ErrorAction Stop
+    }
+}
 
 Write-Step "Resolving group '$GroupName'"
 $group = @(Get-MgGroup -Filter "displayName eq '$($GroupName.Replace("'", "''"))'" -Property Id, DisplayName -Top 2)

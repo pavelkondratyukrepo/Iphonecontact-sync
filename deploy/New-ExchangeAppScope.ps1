@@ -46,6 +46,9 @@
     Skip creation and only run the authorization tests and the Entra permission check.
 .PARAMETER SkipGraphCheck
     Skip the Microsoft Graph check for Contacts.* app role assignments.
+.PARAMETER UseDeviceCode
+    Sign in to Exchange Online and Graph with a device code (Windows Sandbox, no cached account). Without it the
+    script tries the interactive flow first and falls back to device code when it fails.
 
 .EXAMPLE
     ./New-ExchangeAppScope.ps1 -ApplicationId <app id> -ObjectId <object id> `
@@ -63,7 +66,8 @@ param(
     [string]$ScopeAttributeValue = 'CorpiPhone',
     [string]$Organization,
     [switch]$TestOnly,
-    [switch]$SkipGraphCheck
+    [switch]$SkipGraphCheck,
+    [switch]$UseDeviceCode
 )
 
 Set-StrictMode -Version Latest
@@ -87,10 +91,17 @@ function Get-PropertyOrNull {
 # ----------------------------------------------------------------------------------------------------------------
 # Connect
 # ----------------------------------------------------------------------------------------------------------------
-Write-Step 'Connecting to Exchange Online'
-$connectArgs = @{ ShowBanner = $false }
+Write-Step "Connecting to Exchange Online$(if ($UseDeviceCode) { ' (device code)' })"
+$connectArgs = @{ ShowBanner = $false; ErrorAction = 'Stop' }
 if ($Organization) { $connectArgs.Organization = $Organization }
-Connect-ExchangeOnline @connectArgs
+if ($UseDeviceCode) { Connect-ExchangeOnline @connectArgs -Device }
+else {
+    try { Connect-ExchangeOnline @connectArgs }
+    catch {
+        Write-Warning "Interactive Exchange sign-in failed ($($_.Exception.Message)). Falling back to device code, which is expected inside Windows Sandbox."
+        Connect-ExchangeOnline @connectArgs -Device
+    }
+}
 
 if (-not $TestOnly) {
     # ------------------------------------------------------------------------------------------------------------
@@ -198,7 +209,14 @@ if ($SkipGraphCheck) {
 else {
     Write-Step 'Checking Entra for Contacts.* application permissions on the identity (there must be none)'
     Import-Module Microsoft.Graph.Authentication, Microsoft.Graph.Applications -ErrorAction Stop
-    Connect-MgGraph -Scopes 'Application.Read.All' -NoWelcome
+    if ($UseDeviceCode) { Connect-MgGraph -Scopes 'Application.Read.All' -UseDeviceCode -NoWelcome -ErrorAction Stop }
+    else {
+        try { Connect-MgGraph -Scopes 'Application.Read.All' -NoWelcome -ErrorAction Stop }
+        catch {
+            Write-Warning "Interactive Graph sign-in failed ($($_.Exception.Message)). Falling back to device code."
+            Connect-MgGraph -Scopes 'Application.Read.All' -UseDeviceCode -NoWelcome -ErrorAction Stop
+        }
+    }
     $graphSp = Get-MgServicePrincipal -Filter "appId eq '$GraphAppId'" -Property Id, AppRoles | Select-Object -First 1
     $assigned = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ObjectId -All | Where-Object { $_.ResourceId -eq $graphSp.Id })
     $roleById = @{}

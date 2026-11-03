@@ -62,6 +62,10 @@
 .PARAMETER EnableSchedules
     Create the schedules enabled. Without this they are created (and linked) but disabled, so nothing runs
     until you enable them in step 6 of the deployment guide.
+.PARAMETER UseDeviceCode
+    Sign in to Azure and Graph with a device code instead of the interactive browser/broker flow. Use this inside
+    Windows Sandbox or any session without a cached Microsoft account. Without the switch the script tries the
+    interactive flow first and falls back to device code when it fails.
 
 .EXAMPLE
     ./Deploy-Automation.ps1 -SubscriptionId 00000000-0000-0000-0000-000000000000 -ResourceGroupName rg-corpiphone-sync `
@@ -87,7 +91,8 @@ param(
     [string]$ScheduleTimeZone = 'America/New_York',
     [string]$RunbookDirectory = (Join-Path $PSScriptRoot '..' 'runbooks'),
     [switch]$DeferSchedules,
-    [switch]$EnableSchedules
+    [switch]$EnableSchedules,
+    [switch]$UseDeviceCode
 )
 
 Set-StrictMode -Version Latest
@@ -125,6 +130,28 @@ $AlertRuleName = "$AutomationAccountName-job-failed-or-suspended"
 function Write-Step {
     param([string]$Message)
     Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $Message) -ForegroundColor Cyan
+}
+
+function Connect-AzInteractive {
+    <# Connect-AzAccount with device-code fallback. Windows Sandbox has no cached account, so the WAM/browser flow fails there. #>
+    param([Parameter(Mandatory)] [string]$Subscription, [switch]$DeviceCode)
+    if ($DeviceCode) { return (Connect-AzAccount -Subscription $Subscription -UseDeviceAuthentication -ErrorAction Stop) }
+    try { return (Connect-AzAccount -Subscription $Subscription -ErrorAction Stop) }
+    catch {
+        Write-Warning "Interactive Azure sign-in failed ($($_.Exception.Message)). Falling back to device code, which is expected inside Windows Sandbox."
+        return (Connect-AzAccount -Subscription $Subscription -UseDeviceAuthentication -ErrorAction Stop)
+    }
+}
+
+function Connect-GraphInteractive {
+    <# Connect-MgGraph with device-code fallback, same reason as above. #>
+    param([Parameter(Mandatory)] [string[]]$Scopes, [switch]$DeviceCode)
+    if ($DeviceCode) { Connect-MgGraph -Scopes $Scopes -UseDeviceCode -NoWelcome -ErrorAction Stop; return }
+    try { Connect-MgGraph -Scopes $Scopes -NoWelcome -ErrorAction Stop }
+    catch {
+        Write-Warning "Interactive Graph sign-in failed ($($_.Exception.Message)). Falling back to device code, which is expected inside Windows Sandbox."
+        Connect-MgGraph -Scopes $Scopes -UseDeviceCode -NoWelcome -ErrorAction Stop
+    }
 }
 
 function Get-ArmToken {
@@ -208,12 +235,12 @@ foreach ($rb in $Runbooks) {
     $rb.Path = (Resolve-Path $path).Path
 }
 
-Write-Step "Connecting to Azure subscription $SubscriptionId"
-$null = Connect-AzAccount -Subscription $SubscriptionId
+Write-Step "Connecting to Azure subscription $SubscriptionId$(if ($UseDeviceCode) { ' (device code)' })"
+$null = Connect-AzInteractive -Subscription $SubscriptionId -DeviceCode:$UseDeviceCode
 $null = Set-AzContext -Subscription $SubscriptionId
 
 Write-Step 'Connecting to Microsoft Graph (Group.ReadWrite.All, AppRoleAssignment.ReadWrite.All, Application.Read.All)'
-Connect-MgGraph -Scopes 'Group.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'Application.Read.All' -NoWelcome
+Connect-GraphInteractive -Scopes 'Group.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'Application.Read.All' -DeviceCode:$UseDeviceCode
 
 # ----------------------------------------------------------------------------------------------------------------
 # 1. Groups

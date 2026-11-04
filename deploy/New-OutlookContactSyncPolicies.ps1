@@ -160,6 +160,13 @@ function Get-TargetAppIdentifiers {
 function Set-PolicyTargetApps {
     <# Replaces the policy's target app list with the existing apps plus any missing ones from $Required (list of 'ios:<bundle>' / 'android:<package>'). #>
     param([Parameter(Mandatory)] [string]$Collection, [Parameter(Mandatory)] [object]$Policy, [Parameter(Mandatory)] [string[]]$Required)
+    # A policy that targets a built-in app group (allMicrosoftApps, allCoreMicrosoftApps, allApps) already covers Outlook.
+    # Posting selectedPublicApps to it would narrow the policy to the listed apps, so leave it alone.
+    $groupType = [string](Get-Field $Policy 'appGroupType')
+    if ($groupType -and $groupType -ne 'selectedPublicApps') {
+        Write-Host "  target apps left as is: the policy targets the '$groupType' group, which includes Outlook"
+        return
+    }
     $current = Get-TargetAppIdentifiers -Policy $Policy
     $missing = @($Required | Where-Object { $current -notcontains $_ })
     if ($missing.Count -eq 0) { Write-Host '  target apps already include Outlook'; return }
@@ -325,9 +332,11 @@ Write-Host ' Done. Verify by hand (this script does not edit device restriction 
 Write-Host ''
 Write-Host ' Intune > Devices > iOS/iPadOS > Configuration > any Device restrictions profile assigned to corporate iPhones'
 Write-Host ' > App Store, Doc Viewing, Gaming:'
-Write-Host "   - 'Allow managed apps to write contacts to unmanaged contacts accounts'  must be Allow (or Not configured)"
-Write-Host "   - 'Allow unmanaged apps to read from managed contacts accounts'         your choice"
-Write-Host ' With managed open-in blocked and the first setting not allowed, Outlook fails silently.'
+Write-Host "   1. 'Block viewing non-corporate documents in corporate apps'               must NOT be Yes"
+Write-Host "   2. If 'Block viewing corporate documents in unmanaged apps' is Yes, then"
+Write-Host "      'Allow managed apps to write contacts to unmanaged contacts accounts'  must be Yes (Not configured is not enough)"
+Write-Host "   3. 'Allow unmanaged apps to read from managed contacts accounts'         optional, your choice"
+Write-Host ' Get item 2 wrong and Outlook contact sync fails silently on the phone.'
 Write-Host ''
 Write-Host ' User experience: Outlook shows a one-time notice that the administrator enabled contact sync and iOS asks for'
 Write-Host ' Contacts access. The user taps Allow. If they tap Don''t Allow, Outlook shows an Open Settings link under the account.'
@@ -338,7 +347,7 @@ Write-Host '====================================================================
     AppConfigurationPolicyId   = Get-Field $acp 'id'
     AssignedGroupId            = $groupId
     DeviceRestrictionsToVerify = @(
-        'Allow managed apps to write contacts to unmanaged contacts accounts',
-        'Allow unmanaged apps to read from managed contacts accounts'
+        "'Block viewing non-corporate documents in corporate apps' is not Yes",
+        "If 'Block viewing corporate documents in unmanaged apps' is Yes: 'Allow managed apps to write contacts to unmanaged contacts accounts' is Yes"
     )
 }

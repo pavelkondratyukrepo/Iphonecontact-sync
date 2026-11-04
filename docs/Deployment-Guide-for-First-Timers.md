@@ -378,7 +378,10 @@ If your company has an iOS **Device restrictions** profile in Intune, one settin
 
 1. In intune.microsoft.com, go to **Devices**, **iOS/iPadOS**, **Configuration**. Look for profiles of type **Device restrictions** assigned to your iPhones. If there are none, you are done with this step.
 2. Open each one, click **Properties**, then **Edit** next to Configuration settings, and open the section **App Store, Doc Viewing, Gaming**.
-3. Find **Allow managed apps to write contacts to unmanaged contacts accounts**. It must be **Allow** or **Not configured**. If it says **Block**, change it to **Allow** and save. The setting right below it, about unmanaged apps reading managed contacts, is your choice and does not affect this project.
+3. Check these settings on that page:
+   - **Block viewing non-corporate documents in corporate apps** must **not** be **Yes**. If it is, set it to **Not configured** and save.
+   - Look at **Block viewing corporate documents in unmanaged apps**. If it says **Yes**, then **Allow managed apps to write contacts to unmanaged contacts accounts** must also say **Yes**. **Not configured** is not good enough here; if you get this wrong, contacts silently never reach the phone. Change it to **Yes** and save.
+   - **Allow unmanaged apps to read from managed contacts accounts** is your choice and does not affect this project.
 
 ### 4.5 Check it worked
 

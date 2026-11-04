@@ -26,11 +26,18 @@
       2. Per target mailbox, list the contacts this runbook owns: those carrying the DirectorySourceId extended property.
          Every other contact is untouchable and is never read, modified or deleted.
       3. Reconcile, excluding the target's own entry: create when no owned contact has that coworker's id, PATCH when the stored
-         hash differs from the hash of the current fields (or always with -FullRebuild), DELETE owned contacts whose coworker left
-         the directory, and DELETE duplicates that share a source id.
+         hash differs from the hash of the current directory fields, when the fields on the contact itself no longer match
+         (edited on the phone; -DetectLocalEdits), or always with -FullRebuild. DELETE owned contacts whose coworker left the
+         directory, and DELETE duplicates that share a source id.
       4. Send writes through POST /$batch in groups of 20, honoring Retry-After on 429. Mailboxes are processed sequentially.
          A 403 on a mailbox means the Exchange scope has not caught up with a fresh stamp: logged as skipped, not as an error.
       5. One log line per change, a summary object, and a throw at the end if any error occurred so the job shows Failed.
+         The job also fails when mailboxes were targeted but none could be processed (for example every one returned 403,
+         which means the Exchange RBAC assignment is broken, not just lagging), and when the run nears the Automation
+         3-hour limit: it stops cleanly after $TimeBudgetMinutes minutes and reports how many mailboxes were not reached.
+
+    Concurrency: do not start a manual full run while the scheduled run is active (Monday 08:00). Two overlapping runs can
+    both create the same contact; the next run deletes the duplicate, but the user sees it twice until then.
 
     Ownership tagging: every contact written carries categories ['Company Directory'] and two single-value extended properties
     under one fixed GUID namespace: DirectorySourceId (the coworker's Entra object id) and DirectorySourceHash (SHA256 of the
@@ -46,6 +53,10 @@
     When set, only this member's mailbox is processed (onboarding). The directory is still the whole group.
 .PARAMETER FullRebuild
     Rewrite every owned contact regardless of the stored hash. Does not touch contacts the runbook does not own.
+.PARAMETER DetectLocalEdits
+    $true (default) also compares the fields currently on each owned contact with the directory and rewrites the contact
+    when someone edited it on the phone or in Outlook. Set $false if the pilot shows Exchange normalizing a field so that
+    every contact is rewritten on every run (look for 'edited in mailbox' on contacts nobody touched).
 
 .OUTPUTS
     Log lines (strings) followed by one summary [pscustomobject].
@@ -59,7 +70,8 @@ param(
     [string]$GroupName = 'SG-CorpiPhone-Users',
     [string]$ExclusionGroupName = 'SG-Directory-Exclude',
     [string]$UserPrincipalName = '',
-    [bool]$FullRebuild = $false
+    [bool]$FullRebuild = $false,
+    [bool]$DetectLocalEdits = $true
 )
 
 Set-StrictMode -Version Latest
@@ -68,6 +80,7 @@ $ErrorActionPreference = 'Stop'
 $RequiredModules = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Groups')
 $GraphBase = 'https://graph.microsoft.com/v1.0'
 $BatchSize = 20
+$TimeBudgetMinutes = 150   # Azure Automation stops cloud jobs at 3 hours (fair share); stop cleanly well before that.
 
 #region ---------------------------------------------------------------- helpers ------------------------------------------------------------
 function Get-DirectoryContactConstants {
@@ -123,7 +136,7 @@ function Get-HttpStatusCode {
         $ex = $ex.InnerException
     }
     $text = [string]$ErrorRecord.Exception.Message
-    if ($text -match '\b(429|503|504|403|404|400|401)\b') { return [int]$Matches[1] }
+    if ($text -match '\b(429|500|502|503|504|403|404|400|401)\b') { return [int]$Matches[1] }
     return 0
 }
 
@@ -146,7 +159,7 @@ function Invoke-GraphRequestWithRetry {
         }
         catch {
             $status = Get-HttpStatusCode -ErrorRecord $_
-            if ($status -in @(429, 503, 504) -and $attempt -lt $MaxAttempts) {
+            if ($status -in @(429, 500, 502, 503, 504) -and $attempt -lt $MaxAttempts) {
                 $delay = [Math]::Min(60, [Math]::Pow(2, $attempt)) + (Get-Random -Minimum 0 -Maximum 3)
                 Write-SyncLog -Level WARN -Message "Graph $Method $Uri returned $status, retrying in $delay s (attempt $attempt of $MaxAttempts)"
                 Start-Sleep -Seconds $delay
@@ -281,6 +294,26 @@ function New-DirectoryContactBody {
     return $body
 }
 
+function Get-ObservedContactHash {
+    <#
+        Hash of the fields as they currently sit on the contact in the mailbox, computed exactly like the hash of the
+        fields the runbook writes. Differs from the stored DirectorySourceHash when someone edited the contact on the phone.
+        Returns $null when the listing did not include the fields (then local edits cannot be detected for that contact).
+    #>
+    param([Parameter(Mandatory)] [object]$Contact)
+    $hasFields = if ($Contact -is [System.Collections.IDictionary]) { $Contact.Contains('fileAs') } else { $null -ne $Contact.PSObject.Properties['fileAs'] }
+    if (-not $hasFields) { return $null }
+    $fields = [ordered]@{}
+    foreach ($name in @('givenName', 'surname', 'displayName', 'fileAs', 'jobTitle', 'department', 'companyName', 'mobilePhone', 'officeLocation')) {
+        $fields[$name] = ConvertTo-NullIfEmpty (Get-Field -Object $Contact -Name $name)
+    }
+    $phones = Get-Field -Object $Contact -Name 'businessPhones'
+    $fields['businessPhones'] = @(@($phones) | ForEach-Object { ConvertTo-NullIfEmpty $_ } | Where-Object { $null -ne $_ })
+    $mails = Get-Field -Object $Contact -Name 'emailAddresses'
+    $fields['emailAddresses'] = @(@($mails) | Where-Object { $null -ne $_ -and (ConvertTo-NullIfEmpty (Get-Field -Object $_ -Name 'address')) })
+    return Get-DirectoryContactHash -Fields $fields
+}
+
 function ConvertTo-OwnedContactRecord {
     <# Reads the two extended properties off a contact. Returns $null when the contact does not carry DirectorySourceId (not ours). #>
     param([Parameter(Mandatory)] [object]$Contact)
@@ -297,10 +330,11 @@ function ConvertTo-OwnedContactRecord {
     }
     if ([string]::IsNullOrWhiteSpace($sourceId)) { return $null }
     [pscustomobject]@{
-        ContactId   = [string](Get-Field -Object $Contact -Name 'id')
-        DisplayName = [string](Get-Field -Object $Contact -Name 'displayName')
-        SourceId    = $sourceId
-        Hash        = $hash
+        ContactId    = [string](Get-Field -Object $Contact -Name 'id')
+        DisplayName  = [string](Get-Field -Object $Contact -Name 'displayName')
+        SourceId     = $sourceId
+        Hash         = $hash
+        ObservedHash = Get-ObservedContactHash -Contact $Contact
     }
 }
 
@@ -309,7 +343,10 @@ function Get-OwnedContacts {
     param([Parameter(Mandatory)] [string]$UserId)
     $c = Get-DirectoryContactConstants
     $filter = "id eq '$($c.SourceIdPropertyId)' or id eq '$($c.SourceHashPropertyId)'"
-    $uri = "$GraphBase/users/$UserId/contacts?`$select=id,displayName&`$expand=singleValueExtendedProperties(`$filter=$filter)&`$top=999"
+    # The written fields are selected so phone-side edits can be detected. Contacts without DirectorySourceId are dropped
+    # right below, before anything is logged or kept: the runbook never acts on, stores or logs another contact's data.
+    $fieldSelect = 'givenName,surname,displayName,fileAs,jobTitle,department,companyName,mobilePhone,businessPhones,emailAddresses,officeLocation'
+    $uri = "$GraphBase/users/$UserId/contacts?`$select=id,$fieldSelect&`$expand=singleValueExtendedProperties(`$filter=$filter)&`$top=999"
     $raw = @(Get-GraphCollection -Uri $uri)
     $owned = [System.Collections.Generic.List[object]]::new()
     foreach ($r in $raw) {
@@ -323,7 +360,8 @@ function Resolve-MailboxChanges {
     <#
         Pure reconciliation. Given the directory records, the target's own id and the owned contacts in the mailbox, returns
           Creates   : directory records with no owned contact
-          Updates   : @{ ContactId; User; Fields; Hash } where the stored hash differs (or always when FullRebuild)
+          Updates   : @{ ContactId; User; Fields; Hash; Reason } where the stored hash differs from the directory, the fields
+                      on the contact were edited (DetectLocalEdits), or always when FullRebuild
           Deletes   : owned contacts whose SourceId left the directory, plus duplicate owned contacts for one SourceId
           Unchanged : count
     #>
@@ -331,7 +369,8 @@ function Resolve-MailboxChanges {
         [AllowEmptyCollection()] [object[]]$Directory,
         [Parameter(Mandatory)] [string]$TargetUserId,
         [AllowEmptyCollection()] [object[]]$OwnedContacts,
-        [bool]$FullRebuild = $false
+        [bool]$FullRebuild = $false,
+        [bool]$DetectLocalEdits = $true
     )
     $creates = [System.Collections.Generic.List[object]]::new()
     $updates = [System.Collections.Generic.List[object]]::new()
@@ -355,10 +394,16 @@ function Resolve-MailboxChanges {
         if (-not $bySource.ContainsKey($key)) {
             $creates.Add([pscustomobject]@{ User = $u; Fields = $fields; Hash = $hash })
         }
-        elseif ($FullRebuild -or $bySource[$key].Hash -ne $hash) {
-            $updates.Add([pscustomobject]@{ ContactId = $bySource[$key].ContactId; User = $u; Fields = $fields; Hash = $hash })
+        else {
+            $existing = $bySource[$key]
+            $observed = Get-Field -Object $existing -Name 'ObservedHash'
+            $reason = $null
+            if ($FullRebuild) { $reason = 'full rebuild' }
+            elseif ($existing.Hash -ne $hash) { $reason = 'directory changed' }
+            elseif ($DetectLocalEdits -and $observed -and $observed -ne $hash) { $reason = 'edited in mailbox' }
+            if ($reason) { $updates.Add([pscustomobject]@{ ContactId = $existing.ContactId; User = $u; Fields = $fields; Hash = $hash; Reason = $reason }) }
+            else { $unchanged++ }
         }
-        else { $unchanged++ }
     }
     foreach ($key in $bySource.Keys) {
         if (-not $wanted.Contains($key)) { $deletes.Add([pscustomobject]@{ Contact = $bySource[$key]; Reason = 'left directory' }) }
@@ -420,7 +465,7 @@ function Invoke-GraphBatch {
                 $id = [string](Get-Field -Object $resp -Name 'id')
                 $null = $seen.Add($id)
                 $status = [int](Get-Field -Object $resp -Name 'status')
-                if ($status -in @(429, 503, 504)) {
+                if ($status -in @(429, 500, 502, 503, 504)) {
                     $retry.Add(($chunk | Where-Object { [string]$_.id -eq $id } | Select-Object -First 1))
                     $maxRetryAfter = [Math]::Max($maxRetryAfter, (Get-RetryAfterSeconds -Headers (Get-Field -Object $resp -Name 'headers')))
                     continue
@@ -474,6 +519,8 @@ $summary = [ordered]@{
     ContactsUpdated    = 0
     ContactsDeleted    = 0
     ContactsUnchanged  = 0
+    LocalEditsReverted = 0
+    MailboxesNotReached = 0
     MailboxesSkipped   = [ordered]@{}
     Errors             = 0
 }
@@ -494,7 +541,8 @@ function Add-Error {
 }
 
 $mode = if ($WhatIf) { 'WHATIF' } else { 'APPLY' }
-Write-SyncLog "Sync-DirectoryToMailboxes starting. Mode=$mode Group='$GroupName' ExclusionGroup='$ExclusionGroupName' UserPrincipalName='$UserPrincipalName' FullRebuild=$FullRebuild"
+$runStarted = [DateTime]::UtcNow
+Write-SyncLog "Sync-DirectoryToMailboxes starting. Mode=$mode Group='$GroupName' ExclusionGroup='$ExclusionGroupName' UserPrincipalName='$UserPrincipalName' FullRebuild=$FullRebuild DetectLocalEdits=$DetectLocalEdits"
 
 # --- connect -------------------------------------------------------------------------------------------------------
 foreach ($m in $RequiredModules) { Import-Module -Name $m -ErrorAction Stop }
@@ -535,8 +583,15 @@ $summary.MailboxesTargeted = $targets.Count
 Write-SyncLog "Target mailboxes: $($targets.Count)"
 
 # --- 2..4. per mailbox ------------------------------------------------------------------------------------------------
+$targetIndex = 0
 foreach ($target in $targets) {
+    $targetIndex++
     $upn = $target.UserPrincipalName
+    if (([DateTime]::UtcNow - $runStarted).TotalMinutes -ge $TimeBudgetMinutes) {
+        $summary.MailboxesNotReached = $targets.Count - $targetIndex + 1
+        Add-Error "Time budget of $TimeBudgetMinutes minutes used up before the Automation 3-hour limit: $($summary.MailboxesNotReached) mailbox(es) not processed, starting with $upn. Re-run; finished mailboxes are unchanged and go fast."
+        break
+    }
     try {
         $owned = @(Get-OwnedContacts -UserId $target.Id)
     }
@@ -548,7 +603,7 @@ foreach ($target in $targets) {
         continue
     }
 
-    $plan = Resolve-MailboxChanges -Directory $directory -TargetUserId $target.Id -OwnedContacts $owned -FullRebuild $FullRebuild
+    $plan = Resolve-MailboxChanges -Directory $directory -TargetUserId $target.Id -OwnedContacts $owned -FullRebuild $FullRebuild -DetectLocalEdits $DetectLocalEdits
     $summary.ContactsUnchanged += $plan.Unchanged
     Write-SyncLog "$upn : owned=$($owned.Count) create=$($plan.Creates.Count) update=$($plan.Updates.Count) delete=$($plan.Deletes.Count) unchanged=$($plan.Unchanged)"
 
@@ -563,7 +618,7 @@ foreach ($target in $targets) {
     foreach ($u in $plan.Updates) {
         $n++; $id = "u$n"
         $requests.Add(@{ id = $id; method = 'PATCH'; url = "/users/$($target.Id)/contacts/$($u.ContactId)"; body = (New-DirectoryContactBody -Fields $u.Fields -SourceId $u.User.Id -Hash $u.Hash) })
-        $actionById[$id] = @{ Action = 'UPDATE'; Label = "$($u.Fields.fileAs) <$($u.User.UserPrincipalName)>" }
+        $actionById[$id] = @{ Action = 'UPDATE'; Label = "$($u.Fields.fileAs) <$($u.User.UserPrincipalName)> ($($u.Reason))"; LocalEdit = ($u.Reason -eq 'edited in mailbox') }
     }
     foreach ($d in $plan.Deletes) {
         $n++; $id = "d$n"
@@ -577,13 +632,23 @@ foreach ($target in $targets) {
         }
         $summary.ContactsAdded += $plan.Creates.Count
         $summary.ContactsUpdated += $plan.Updates.Count
+        $summary.LocalEditsReverted += @($plan.Updates | Where-Object { $_.Reason -eq 'edited in mailbox' }).Count
         $summary.ContactsDeleted += $plan.Deletes.Count
         $summary.MailboxesProcessed++
         continue
     }
 
     if ($requests.Count -gt 0) {
-        $results = Invoke-GraphBatch -Requests $requests.ToArray()
+        try {
+            $results = Invoke-GraphBatch -Requests $requests.ToArray()
+        }
+        catch {
+            # A $batch call that fails as a whole (network, 5xx after retries) costs this mailbox only; the rest still run.
+            $status = Get-HttpStatusCode -ErrorRecord $_
+            if ($status -eq 403) { Add-Skip -Reason 'AccessDenied' -Detail "$upn : 403 on write. The Exchange RBAC scope has not caught up with a fresh stamp (30 min to 2 h). Re-run later."; continue }
+            Add-Error "Writing contacts failed for $upn (HTTP $status): $($_.Exception.Message)"
+            continue
+        }
         $mailboxForbidden = $false
         foreach ($id in $actionById.Keys | Sort-Object) {
             $action = $actionById[$id]
@@ -592,7 +657,7 @@ foreach ($target in $targets) {
             if ($status -ge 200 -and $status -lt 300) {
                 switch ($action.Action) {
                     'CREATE' { $summary.ContactsAdded++ }
-                    'UPDATE' { $summary.ContactsUpdated++ }
+                    'UPDATE' { $summary.ContactsUpdated++; if ($action.Contains('LocalEdit') -and $action.LocalEdit) { $summary.LocalEditsReverted++ } }
                     'DELETE' { $summary.ContactsDeleted++ }
                 }
                 Write-SyncLog -Level CHANGE -Message "APPLY $($action.Action) mailbox=$upn $($action.Label)"
@@ -616,7 +681,16 @@ foreach ($target in $targets) {
 }
 
 # --- 5. summary ----------------------------------------------------------------------------------------------------------
-Write-SyncLog "Sync-DirectoryToMailboxes finished. Directory=$($summary.DirectorySize) Targeted=$($summary.MailboxesTargeted) Processed=$($summary.MailboxesProcessed) Added=$($summary.ContactsAdded) Updated=$($summary.ContactsUpdated) Deleted=$($summary.ContactsDeleted) Unchanged=$($summary.ContactsUnchanged) Skipped=$(($summary.MailboxesSkipped.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') Errors=$($summary.Errors)"
+if ($summary.MailboxesTargeted -gt 0 -and $summary.MailboxesProcessed -eq 0 -and $summary.MailboxesNotReached -eq 0) {
+    $accessDenied = if ($summary.MailboxesSkipped.Contains('AccessDenied')) { $summary.MailboxesSkipped['AccessDenied'] } else { 0 }
+    if ($accessDenied -gt 0) {
+        Add-Error "None of the $($summary.MailboxesTargeted) targeted mailboxes could be processed ($accessDenied returned 403). Scope lag affects fresh stamps only, so this means the Exchange RBAC assignment is missing or broken. Check it with deploy/New-ExchangeAppScope.ps1 -TestOnly."
+    }
+    elseif ($summary.Errors -eq 0) {
+        Add-Error "None of the $($summary.MailboxesTargeted) targeted mailboxes could be processed. See the SKIP lines above."
+    }
+}
+Write-SyncLog "Sync-DirectoryToMailboxes finished. Directory=$($summary.DirectorySize) Targeted=$($summary.MailboxesTargeted) Processed=$($summary.MailboxesProcessed) Added=$($summary.ContactsAdded) Updated=$($summary.ContactsUpdated) Deleted=$($summary.ContactsDeleted) Unchanged=$($summary.ContactsUnchanged) LocalEditsReverted=$($summary.LocalEditsReverted) Skipped=$(($summary.MailboxesSkipped.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') Errors=$($summary.Errors)"
 [pscustomobject]$summary
 
 if ($summary.Errors -gt 0) {

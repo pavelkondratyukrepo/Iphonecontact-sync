@@ -21,8 +21,9 @@
          -GraphModuleVersion. The 7.2 runtime is .NET 6 and cannot load current Graph SDK modules.
       5. Both runbooks imported and published into that runtime environment.
       6. Schedules (daily 05:00 and weekly Monday 08:00 in -ScheduleTimeZone) linked to the runbooks with
-         WhatIf = $false. They are created disabled unless -EnableSchedules is passed; -DeferSchedules skips them.
-      7. An action group and an Azure Monitor metric alert that emails -AlertEmail when a job ends Failed or Suspended.
+         WhatIf = $false. New schedules are created disabled unless -EnableSchedules is passed; a re-run without the
+         switch leaves existing schedules exactly as they are. -DeferSchedules skips them.
+      7. An action group and an Azure Monitor metric alert that emails -AlertEmail when a job ends Failed, Suspended or Stopped.
 
     What it does NOT do
       - It does not touch Exchange Online. Run deploy/New-ExchangeAppScope.ps1 next with the two ids this script prints.
@@ -37,7 +38,7 @@
 .PARAMETER AutomationAccountName
     Name of the Automation account to create or reuse.
 .PARAMETER AlertEmail
-    Address that receives the Failed/Suspended job alert.
+    Address that receives the Failed/Suspended/Stopped job alert.
 .PARAMETER ControlGroupName
     Display name of the dynamic security group that Runbook 1 fills through the stamp. Default SG-CorpiPhone-Users.
 .PARAMETER ExclusionGroupName
@@ -60,8 +61,8 @@
 .PARAMETER DeferSchedules
     Skip creating and linking schedules entirely.
 .PARAMETER EnableSchedules
-    Create the schedules enabled. Without this they are created (and linked) but disabled, so nothing runs
-    until you enable them in step 6 of the deployment guide.
+    Enable the schedules (new or existing). Without this, new schedules are created (and linked) but disabled, so
+    nothing runs until step 6 of the deployment guide, and existing schedules are left exactly as they are.
 .PARAMETER UseDeviceCode
     Sign in to Azure and Graph with a device code instead of the interactive browser/broker flow. Use this inside
     Windows Sandbox or any session without a cached Microsoft account. Without the switch the script tries the
@@ -420,8 +421,22 @@ foreach ($rb in $Runbooks) {
         Write-Host "  created   $($rb.Name)"
     }
     elseif ($existing.properties.runtimeEnvironment -ne $RuntimeEnvironmentName) {
-        $null = Invoke-Arm -Method PATCH -Path "$rbPath`?api-version=$AutomationApiVersion" -Body @{
-            properties = @{ runtimeEnvironment = $RuntimeEnvironmentName }
+        # PATCH does not change runtimeEnvironment; a PUT with the full body does. Content is re-uploaded and
+        # published just below, so replacing the runbook definition loses nothing.
+        $null = Invoke-Arm -Method PUT -Path "$rbPath`?api-version=$AutomationApiVersion" -Body @{
+            location   = $Location
+            properties = @{
+                runbookType        = 'PowerShell'
+                runtimeEnvironment = $RuntimeEnvironmentName
+                logProgress        = $false
+                logVerbose         = $false
+                description        = $rb.Description
+                draft              = @{}
+            }
+        }
+        $moved = Get-ArmOrNull -Path "$rbPath`?api-version=$AutomationApiVersion"
+        if (-not $moved -or $moved.properties.runtimeEnvironment -ne $RuntimeEnvironmentName) {
+            throw "Runbook $($rb.Name) is still not in runtime environment $RuntimeEnvironmentName. Move it in the portal (Runbook > Edit > Runtime environment) and re-run."
         }
         Write-Host "  moved     $($rb.Name) to runtime environment $RuntimeEnvironmentName"
     }
@@ -484,7 +499,17 @@ else {
 
     foreach ($def in $scheduleDefinitions) {
         $schedule = Get-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name -ErrorAction SilentlyContinue
+        $isNew = $false
+        if ($schedule -and $EnableSchedules -and -not $schedule.IsEnabled -and $schedule.StartTime -lt [DateTimeOffset]::UtcNow) {
+            # A disabled schedule whose start time has passed is rejected when re-enabled; recreate it with the next start time.
+            $null = Unregister-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
+                -RunbookName $def.Runbook -ScheduleName $def.Name -Force -ErrorAction SilentlyContinue
+            Remove-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name -Force
+            Write-Host "  removed stale schedule $($def.Name) so it is recreated with the next start time"
+            $schedule = $null
+        }
         if (-not $schedule) {
+            $isNew = $true
             if ($def.Weekly) {
                 $schedule = New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name `
                     -StartTime $def.StartTime -WeekInterval 1 -DaysOfWeek Monday -TimeZone $ScheduleTimeZone
@@ -506,9 +531,21 @@ else {
         }
         else { Write-Host "  linked  $($def.Name) -> $($def.Runbook) (already)" }
 
-        $null = Set-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name -IsEnabled $EnableSchedules.IsPresent
+        # Only change enablement when asked: a plain re-run must never switch off schedules that are already live.
+        if ($EnableSchedules) {
+            $null = Set-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name -IsEnabled $true
+            Write-Host "  ENABLED $($def.Name)"
+        }
+        elseif ($isNew) {
+            $null = Set-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name -IsEnabled $false
+            Write-Host "  disabled $($def.Name) (new schedules start disabled until the pilot passes)"
+        }
+        else {
+            $current = Get-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name
+            Write-Host "  left    $($def.Name) as it was (Enabled: $($current.IsEnabled))"
+        }
     }
-    if ($EnableSchedules) { Write-Host '  schedules ENABLED' } else { Write-Host '  schedules created DISABLED. Enable them after the pilot (deployment guide step 6) or re-run with -EnableSchedules.' }
+    if (-not $EnableSchedules) { Write-Host '  To switch the schedules on after the pilot, re-run with -EnableSchedules (deployment guide step 6).' }
 }
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -520,9 +557,14 @@ if (-not $actionGroup) {
     $shortName = ($AutomationAccountName -replace '[^A-Za-z0-9]', '')
     if ($shortName.Length -gt 12) { $shortName = $shortName.Substring(0, 12) }
     if (Get-Command -Name New-AzActionGroupEmailReceiverObject -ErrorAction SilentlyContinue) {
-        # Az.Monitor 5.x and later
+        # Az.Monitor 5.x and later. The short-name parameter was renamed to GroupShortName, and -Enabled is passed
+        # explicitly so the group is never created switched off (which would silently drop every alert email).
         $receiver = New-AzActionGroupEmailReceiverObject -Name 'ops-email' -EmailAddress $AlertEmail
-        $actionGroup = New-AzActionGroup -ResourceGroupName $ResourceGroupName -Name $AlertActionGroupName -ShortName $shortName -Location 'Global' -EmailReceiver $receiver
+        $agParams = @{ ResourceGroupName = $ResourceGroupName; Name = $AlertActionGroupName; Location = 'Global'; EmailReceiver = $receiver }
+        $agCommand = Get-Command -Name New-AzActionGroup
+        if ($agCommand.Parameters.ContainsKey('GroupShortName')) { $agParams.GroupShortName = $shortName } else { $agParams.ShortName = $shortName }
+        if ($agCommand.Parameters.ContainsKey('Enabled')) { $agParams.Enabled = $true }
+        $actionGroup = New-AzActionGroup @agParams
     }
     else {
         # Az.Monitor 4.x and earlier
@@ -532,15 +574,23 @@ if (-not $actionGroup) {
     Write-Host '  created'
 }
 else { Write-Host '  exists' }
+if ($actionGroup.PSObject.Properties['Enabled'] -and -not $actionGroup.Enabled) {
+    if (Get-Command -Name Update-AzActionGroup -ErrorAction SilentlyContinue) {
+        $actionGroup = Update-AzActionGroup -ResourceGroupName $ResourceGroupName -Name $AlertActionGroupName -Enabled
+        Write-Host '  was disabled; enabled it'
+    }
+    else { Write-Warning "Action group $AlertActionGroupName is DISABLED, so failure emails will not be sent. Enable it in the portal (Monitor > Alerts > Action groups)." }
+}
 
-Write-Step "Ensuring metric alert '$AlertRuleName' (TotalJob where Status in Failed, Suspended)"
-$dimension = New-AzMetricAlertRuleV2DimensionSelection -DimensionName 'Status' -ValuesToInclude 'Failed', 'Suspended'
+Write-Step "Ensuring metric alert '$AlertRuleName' (TotalJob where Status in Failed, Suspended, Stopped)"
+# Stopped is included because a job that hits the Automation 3-hour fair-share limit ends Stopped, not Failed.
+$dimension = New-AzMetricAlertRuleV2DimensionSelection -DimensionName 'Status' -ValuesToInclude 'Failed', 'Suspended', 'Stopped'
 $criteria = New-AzMetricAlertRuleV2Criteria -MetricName 'TotalJob' -MetricNamespace 'Microsoft.Automation/automationAccounts' `
     -DimensionSelection $dimension -TimeAggregation Total -Operator GreaterThan -Threshold 0
 $null = Add-AzMetricAlertRuleV2 -Name $AlertRuleName -ResourceGroupName $ResourceGroupName -Severity 2 `
     -WindowSize ([TimeSpan]::FromHours(1)) -Frequency ([TimeSpan]::FromMinutes(15)) `
-    -TargetResourceId $aa.AutomationAccountId -Condition $criteria -ActionGroupId $actionGroup.Id `
-    -Description 'A CorpiPhone directory sync runbook job ended Failed or Suspended.'
+    -TargetResourceId $aaPath -Condition $criteria -ActionGroupId $actionGroup.Id `
+    -Description 'A CorpiPhone directory sync runbook job ended Failed, Suspended or Stopped.'
 Write-Host '  upserted'
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -563,7 +613,7 @@ Write-Host '====================================================================
     IdentityObjectId      = $identityObjectId
     ControlGroupId        = $controlGroup.Id
     ExclusionGroupId      = $exclusionGroup.Id
-    AutomationAccountId   = $aa.AutomationAccountId
+    AutomationAccountId   = $aaPath
     RuntimeEnvironment    = $RuntimeEnvironmentName
     GraphModuleVersion    = $GraphModuleVersion
 }

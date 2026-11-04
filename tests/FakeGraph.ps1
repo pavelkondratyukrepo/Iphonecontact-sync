@@ -180,13 +180,17 @@ function Invoke-MgGraphRequest {
         $projected = @($page | ForEach-Object {
                 $c = $_
                 $out = @{ id = $c.id; displayName = $c.displayName }
+                foreach ($f in @(([string]$query['$select']).Split(',') | Where-Object { $_ -and $_ -ne 'id' })) {
+                    # Like Graph: a selected property is always present, null when the contact has no value.
+                    $out[$f] = if ($c.ContainsKey($f)) { $c[$f] } else { $null }
+                }
                 $props = @($c.singleValueExtendedProperties | Where-Object { $_.id -match 'DirectorySourceId|DirectorySourceHash' })
                 if ($props.Count -gt 0) { $out.singleValueExtendedProperties = $props }
                 $out
             })
         $result = @{ value = $projected }
         if ($skip + $t.ContactPageSize -lt $all.Count) {
-            $result['@odata.nextLink'] = "https://graph.microsoft.com/v1.0$path`?`$expand=singleValueExtendedProperties(x)&`$skip=$($skip + $t.ContactPageSize)"
+            $result['@odata.nextLink'] = "https://graph.microsoft.com/v1.0$path`?`$select=$($query['$select'])&`$expand=singleValueExtendedProperties(x)&`$skip=$($skip + $t.ContactPageSize)"
         }
         return $result
     }

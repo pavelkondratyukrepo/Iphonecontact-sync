@@ -157,7 +157,10 @@ Change the device's primary user in Intune. Runbook 1 moves the stamp on its nex
 1. APP: Data protection > Data transfer > *Sync policy managed app data with native apps or add-ins* must be Allow on the policy the device receives. Check Intune > Apps > App protection policies > the policy > Properties, and the device's App protection status report.
 2. ACP: *Save Contacts* = Yes on the managed-apps ACP assigned to the user. Check the Outlook settings page on the phone under the account: Save Contacts should show on and locked.
 3. iOS Contacts permission denied: iOS Settings > Outlook > Contacts must be on. Outlook also shows an *Open Settings* link under the account when denied.
-4. Device restriction profile: *Allow managed apps to write contacts to unmanaged contacts accounts* must be Allow (or not configured) in any iOS device restrictions profile assigned to the phone. With managed open-in blocked and this not allowed, Outlook fails silently.
+4. Device restriction profiles assigned to the phone (Intune > Devices > iOS/iPadOS > Configuration > Device restrictions > App Store, Doc Viewing, Gaming):
+   - *Block viewing non-corporate documents in corporate apps* must not be **Yes**.
+   - If *Block viewing corporate documents in unmanaged apps* is **Yes**, then *Allow managed apps to write contacts to unmanaged contacts accounts* must be **Yes**. *Not configured* is not enough, and Outlook fails silently.
+   - *Allow unmanaged apps to read from managed contacts accounts* is optional.
 5. Policies apply on the next Outlook check-in; force one by closing and reopening Outlook or by syncing the device from Company Portal.
 
 **Duplicate contacts.** Two kinds. Duplicates among runbook-owned contacts (same `DirectorySourceId`) are deleted automatically on the next run; the log shows `DELETE ... (duplicate)`. Duplicates between a runbook contact and a personal contact the user created themselves are expected and untouched; the user can delete their own copy. If the native app shows a coworker twice with the same data, check that Outlook is not also syncing contacts from a second account.

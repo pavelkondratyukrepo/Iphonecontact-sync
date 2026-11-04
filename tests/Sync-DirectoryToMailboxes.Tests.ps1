@@ -233,6 +233,35 @@ Describe 'Resolve-MailboxChanges' {
         }
     }
 
+    It 'rewrites a contact whose fields were edited in the mailbox, only when DetectLocalEdits is on' {
+        $current = Owned -ContactId 'c-john' -User $UserNoMobile
+        $edited = [pscustomobject]@{ ContactId = $current.ContactId; DisplayName = $current.DisplayName; SourceId = $current.SourceId; Hash = $current.Hash; ObservedHash = 'something-else' }
+        $plan = Resolve-MailboxChanges -Directory @($UserNoMobile) -TargetUserId $UserAllFields.Id -OwnedContacts @($edited)
+        $plan.Updates.Count | Should -Be 1
+        $plan.Updates[0].Reason | Should -Be 'edited in mailbox'
+        $plan = Resolve-MailboxChanges -Directory @($UserNoMobile) -TargetUserId $UserAllFields.Id -OwnedContacts @($edited) -DetectLocalEdits $false
+        $plan.Updates.Count | Should -Be 0
+        $plan.Unchanged | Should -Be 1
+    }
+
+    It 'treats a matching observed hash, or none at all, as unchanged' {
+        $current = Owned -ContactId 'c-john' -User $UserNoMobile
+        $same = [pscustomobject]@{ ContactId = 'c-john'; DisplayName = 'x'; SourceId = $current.SourceId; Hash = $current.Hash; ObservedHash = $current.Hash }
+        (Resolve-MailboxChanges -Directory @($UserNoMobile) -TargetUserId $UserAllFields.Id -OwnedContacts @($same)).Unchanged | Should -Be 1
+        (Resolve-MailboxChanges -Directory @($UserNoMobile) -TargetUserId $UserAllFields.Id -OwnedContacts @($current)).Unchanged | Should -Be 1
+    }
+
+    It 'computes the observed hash of a written contact equal to the hash it was written with' {
+        $fields = ConvertTo-DirectoryContactFields -User $UserAllFields
+        $hash = Get-DirectoryContactHash -Fields $fields
+        $asReturned = @{ id = 'c1' }
+        foreach ($k in $fields.Keys) { $asReturned[$k] = $fields[$k] }
+        Get-ObservedContactHash -Contact $asReturned | Should -Be $hash
+        $asReturned.jobTitle = 'Changed'
+        Get-ObservedContactHash -Contact $asReturned | Should -Not -Be $hash
+        Get-ObservedContactHash -Contact @{ id = 'c2'; displayName = 'listed without fields' } | Should -BeNullOrEmpty
+    }
+
     It 'creates everyone except the target on an empty mailbox' {
         $plan = Resolve-MailboxChanges -Directory $directory -TargetUserId $UserAllFields.Id -OwnedContacts @()
         $plan.Creates.Count | Should -Be 2
@@ -359,14 +388,14 @@ Describe 'Invoke-GraphBatch' {
 }
 
 Describe 'Get-OwnedContacts request shape' {
-    It 'expands only the two ownership properties, selects minimal fields and pages at 999' {
+    It 'expands only the two ownership properties, selects only the written fields and pages at 999' {
         $script:uri = $null
         Mock Get-GraphCollection { param($Uri) $script:uri = $Uri; @() }
         $null = Get-OwnedContacts -UserId 'user-1'
         $c = Get-DirectoryContactConstants
         $script:uri | Should -Match '^https://graph\.microsoft\.com/v1\.0/users/user-1/contacts\?'
         $script:uri | Should -Match '\$top=999'
-        $script:uri | Should -Match '\$select=id,displayName'
+        $script:uri | Should -Match '\$select=id,givenName,surname,displayName,fileAs,jobTitle,department,companyName,mobilePhone,businessPhones,emailAddresses,officeLocation&'
         $script:uri | Should -Match ([regex]::Escape("`$expand=singleValueExtendedProperties(`$filter=id eq '$($c.SourceIdPropertyId)' or id eq '$($c.SourceHashPropertyId)')"))
     }
 }

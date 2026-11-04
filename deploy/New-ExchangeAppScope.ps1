@@ -81,6 +81,26 @@ function Write-Step {
     Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $Message) -ForegroundColor Cyan
 }
 
+function Test-IsThisIdentity {
+    # Exchange reports a service principal assignee by its Exchange identity, which can be the object id, the app id,
+    # the display name or the service principal's Name, depending on module version. Match any of them.
+    param([Parameter(Mandatory)] [object]$Assignment, [string[]]$Names)
+    foreach ($prop in 'RoleAssignee', 'RoleAssigneeName', 'App') {
+        $v = [string](Get-PropertyOrNull $Assignment $prop)
+        if ($v -and ($Names -contains $v)) { return $true }
+    }
+    return $false
+}
+
+function Get-AssignmentScope {
+    param([Parameter(Mandatory)] [object]$Assignment)
+    foreach ($prop in 'CustomResourceScope', 'CustomRecipientWriteScope') {
+        $v = [string](Get-PropertyOrNull $Assignment $prop)
+        if ($v) { return $v }
+    }
+    return ''
+}
+
 function Get-PropertyOrNull {
     param([Parameter(Mandatory)] [object]$InputObject, [Parameter(Mandatory)] [string]$Name)
     $p = $InputObject.PSObject.Properties[$Name]
@@ -103,6 +123,7 @@ else {
     }
 }
 
+try {
 if (-not $TestOnly) {
     # ------------------------------------------------------------------------------------------------------------
     # 1. Service principal
@@ -142,29 +163,25 @@ if (-not $TestOnly) {
     # 3. Role assignment
     # ------------------------------------------------------------------------------------------------------------
     Write-Step "Ensuring role assignment '$RoleName' for the identity, restricted to scope '$ScopeName'"
-    $assignments = @(Get-ManagementRoleAssignment -Role $RoleName -ErrorAction SilentlyContinue)
-    $existing = $assignments | Where-Object {
-        $assignee = [string](Get-PropertyOrNull $_ 'RoleAssignee')
-        $app = [string](Get-PropertyOrNull $_ 'App')
-        $writeScope = [string](Get-PropertyOrNull $_ 'CustomRecipientWriteScope')
-        ($assignee -eq $ObjectId -or $assignee -eq $ServicePrincipalDisplayName -or $app -eq $ObjectId -or $app -eq $ApplicationId) -and $writeScope -eq $ScopeName
-    } | Select-Object -First 1
+    # A fixed name makes the assignment easy to find and makes an accidental duplicate fail loudly instead of stacking.
+    $assignmentName = "CorpiPhone-ContactsReadWrite-$ScopeName"
+    $identityNames = @($ObjectId, $ApplicationId, $ServicePrincipalDisplayName, [string](Get-PropertyOrNull $sp 'Identity'), [string](Get-PropertyOrNull $sp 'Name')) |
+        Where-Object { $_ } | Select-Object -Unique
+    $assignments = @(Get-ManagementRoleAssignment -Role $RoleName -ErrorAction SilentlyContinue | Where-Object { Test-IsThisIdentity -Assignment $_ -Names $identityNames })
+    $existing = $assignments | Where-Object { $_.Name -eq $assignmentName -or (Get-AssignmentScope $_) -eq $ScopeName } | Select-Object -First 1
     if (-not $existing) {
-        $existing = New-ManagementRoleAssignment -App $ObjectId -Role $RoleName -CustomResourceScope $ScopeName
+        $existing = New-ManagementRoleAssignment -Name $assignmentName -App $ObjectId -Role $RoleName -CustomResourceScope $ScopeName
         Write-Host "  created '$($existing.Name)'"
     }
     else {
-        Write-Host "  exists '$($existing.Name)'"
+        Write-Host "  exists '$($existing.Name)' (scope [$(Get-AssignmentScope $existing)])"
     }
 
     # Any other assignment of the same role to this identity (for example an unscoped one made by hand) widens access.
-    $others = $assignments | Where-Object {
-        $assignee = [string](Get-PropertyOrNull $_ 'RoleAssignee')
-        $app = [string](Get-PropertyOrNull $_ 'App')
-        ($assignee -eq $ObjectId -or $app -eq $ObjectId -or $app -eq $ApplicationId) -and $_.Name -ne $existing.Name
-    }
-    foreach ($o in $others) {
-        Write-Warning "Additional '$RoleName' assignment '$($o.Name)' exists for this identity with scope [$(Get-PropertyOrNull $o 'CustomRecipientWriteScope')]. Remove it unless intended: Remove-ManagementRoleAssignment -Identity '$($o.Name)'"
+    foreach ($o in @($assignments | Where-Object { $_.Name -ne $existing.Name })) {
+        $otherScope = Get-AssignmentScope $o
+        if (-not $otherScope) { $otherScope = 'NONE - tenant-wide' }
+        Write-Warning "Additional '$RoleName' assignment '$($o.Name)' exists for this identity with scope [$otherScope]. Remove it unless intended: Remove-ManagementRoleAssignment -Identity '$($o.Name)'"
     }
 
     Write-Host ''
@@ -199,6 +216,11 @@ $results = foreach ($upn in @($StampedUserPrincipalName, $UnstampedUserPrincipal
 $results | Format-Table -AutoSize | Out-String | Write-Host
 Write-Host '  Right after first deployment both show InScope=False because nobody carries the stamp yet.' -ForegroundColor Yellow
 Write-Host '  After Runbook 1 has run live, re-run this script with -TestOnly: the stamped user must show True, the other False.' -ForegroundColor Yellow
+}
+finally {
+    # Disconnect before Graph: loading the Exchange and Graph authentication libraries into one session can clash.
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+}
 
 # ----------------------------------------------------------------------------------------------------------------
 # 5. Verify the identity has no Contacts.* permission consented in Entra
@@ -208,36 +230,48 @@ if ($SkipGraphCheck) {
 }
 else {
     Write-Step 'Checking Entra for Contacts.* application permissions on the identity (there must be none)'
-    Import-Module Microsoft.Graph.Authentication, Microsoft.Graph.Applications -ErrorAction Stop
-    if ($UseDeviceCode) { Connect-MgGraph -Scopes 'Application.Read.All' -UseDeviceCode -NoWelcome -ErrorAction Stop }
-    else {
-        try { Connect-MgGraph -Scopes 'Application.Read.All' -NoWelcome -ErrorAction Stop }
-        catch {
-            Write-Warning "Interactive Graph sign-in failed ($($_.Exception.Message)). Falling back to device code."
-            Connect-MgGraph -Scopes 'Application.Read.All' -UseDeviceCode -NoWelcome -ErrorAction Stop
-        }
-    }
-    $graphSp = Get-MgServicePrincipal -Filter "appId eq '$GraphAppId'" -Property Id, AppRoles | Select-Object -First 1
-    $assigned = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ObjectId -All | Where-Object { $_.ResourceId -eq $graphSp.Id })
-    $roleById = @{}
-    foreach ($r in $graphSp.AppRoles) { $roleById[[string]$r.Id] = $r.Value }
-    $granted = @($assigned | ForEach-Object { $roleById[[string]$_.AppRoleId] } | Where-Object { $_ })
-    $contactsGrants = @($granted | Where-Object { $_ -like 'Contacts.*' })
-
-    Write-Host "  Graph application permissions on the identity: $($granted -join ', ')"
-    if ($contactsGrants.Count -gt 0) {
-        Write-Host ''
-        Write-Host '  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' -ForegroundColor Red
-        Write-Host "  !!! The identity holds $($contactsGrants -join ', ') in ENTRA. That grant is tenant-wide and UNSCOPED." -ForegroundColor Red
-        Write-Host '  !!! Entra grants and Exchange RBAC grants are a union: the Exchange scope created above does NOTHING' -ForegroundColor Red
-        Write-Host '  !!! until that Entra grant is removed. Remove it in Entra > Enterprise applications > the identity >' -ForegroundColor Red
-        Write-Host '  !!! Permissions, or with Remove-MgServicePrincipalAppRoleAssignment, then re-run with -TestOnly.' -ForegroundColor Red
-        Write-Host '  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' -ForegroundColor Red
-        Write-Warning "Unscoped Contacts permission present in Entra: $($contactsGrants -join ', ')"
-    }
-    else {
-        Write-Host '  OK: no Contacts.* permission in Entra. Contacts access comes only from the scoped Exchange role.' -ForegroundColor Green
+    # Runs in a separate pwsh process: ExchangeOnlineManagement and Microsoft.Graph ship different MSAL versions and
+    # loading both into one session can fail with an assembly conflict.
+    $checkScript = Join-Path ([System.IO.Path]::GetTempPath()) "CorpiPhone-EntraCheck-$([guid]::NewGuid().ToString('N')).ps1"
+    Set-Content -Path $checkScript -Encoding UTF8 -Value @'
+param([string]$ObjectId, [string]$GraphAppId, [string]$DeviceCode)
+$UseDeviceCode = $DeviceCode -eq 'yes'
+$ErrorActionPreference = 'Stop'
+Import-Module Microsoft.Graph.Authentication, Microsoft.Graph.Applications
+if ($UseDeviceCode) { Connect-MgGraph -Scopes 'Application.Read.All' -UseDeviceCode -NoWelcome }
+else {
+    try { Connect-MgGraph -Scopes 'Application.Read.All' -NoWelcome }
+    catch {
+        Write-Warning "Interactive Graph sign-in failed ($($_.Exception.Message)). Falling back to device code."
+        Connect-MgGraph -Scopes 'Application.Read.All' -UseDeviceCode -NoWelcome
     }
 }
-
-Disconnect-ExchangeOnline -Confirm:$false
+$graphSp = Get-MgServicePrincipal -Filter "appId eq '$GraphAppId'" -Property Id, AppRoles | Select-Object -First 1
+$assigned = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ObjectId -All | Where-Object { $_.ResourceId -eq $graphSp.Id })
+$roleById = @{}
+foreach ($r in $graphSp.AppRoles) { $roleById[[string]$r.Id] = $r.Value }
+$granted = @($assigned | ForEach-Object { $roleById[[string]$_.AppRoleId] } | Where-Object { $_ })
+$contactsGrants = @($granted | Where-Object { $_ -like 'Contacts.*' })
+$null = Disconnect-MgGraph -ErrorAction SilentlyContinue
+Write-Host "  Graph application permissions on the identity: $($granted -join ', ')"
+if ($contactsGrants.Count -gt 0) {
+    Write-Host ''
+    Write-Host '  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' -ForegroundColor Red
+    Write-Host "  !!! The identity holds $($contactsGrants -join ', ') in ENTRA. That grant is tenant-wide and UNSCOPED." -ForegroundColor Red
+    Write-Host '  !!! Entra grants and Exchange RBAC grants are a union: the Exchange scope created above does NOTHING' -ForegroundColor Red
+    Write-Host '  !!! until that Entra grant is removed. Remove it in Entra > Enterprise applications > the identity >' -ForegroundColor Red
+    Write-Host '  !!! Permissions, or with Remove-MgServicePrincipalAppRoleAssignment, then re-run with -TestOnly.' -ForegroundColor Red
+    Write-Host '  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' -ForegroundColor Red
+    exit 2
+}
+Write-Host '  OK: no Contacts.* permission in Entra. Contacts access comes only from the scoped Exchange role.' -ForegroundColor Green
+exit 0
+'@
+    try {
+        & ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -File $checkScript -ObjectId $ObjectId -GraphAppId $GraphAppId -DeviceCode $(if ($UseDeviceCode) { 'yes' } else { 'no' })
+        $checkExit = $LASTEXITCODE
+    }
+    finally { Remove-Item -Path $checkScript -Force -ErrorAction SilentlyContinue }
+    if ($checkExit -eq 2) { Write-Warning 'Unscoped Contacts permission present in Entra. See the red banner above.' }
+    elseif ($checkExit -ne 0) { Write-Warning "The Entra permission check did not complete (exit code $checkExit). Make sure Microsoft.Graph.Authentication and Microsoft.Graph.Applications are installed, or run Deploy-Automation.ps1 again, which performs the same check." }
+}

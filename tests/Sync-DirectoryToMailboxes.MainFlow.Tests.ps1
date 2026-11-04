@@ -20,6 +20,16 @@ BeforeAll {
         Get-DirectoryContactHash -Fields (ConvertTo-DirectoryContactFields -User (ConvertTo-DirectoryUserRecord -User $u))
     }
 
+    function Get-CurrentFields {
+        <# The fields exactly as the runbook writes them for this user, as a plain hashtable for Add-FakeContact. #>
+        param([string]$UserId)
+        $u = $global:FakeTenant.Users | Where-Object { $_.id -eq $UserId }
+        $f = ConvertTo-DirectoryContactFields -User (ConvertTo-DirectoryUserRecord -User $u)
+        $h = @{}
+        foreach ($k in $f.Keys) { $h[$k] = $f[$k] }
+        return $h
+    }
+
     function New-Scenario {
         $t = New-FakeTenant
         $null = Add-FakeUser -Id 'u1' -Upn 'ann.lee@contoso.com' -Ext1 'CorpiPhone' -Mobile '+18045550001' -Extra @{ businessPhones = @('+18045550100'); jobTitle = 'CFO' }
@@ -42,7 +52,7 @@ BeforeAll {
         $null = Add-FakeContact -MailboxUserId 'u1' -DisplayName 'bob.ray (old title)' -SourceId 'u2' -Hash 'stale'   # stale -> update
         $null = Add-FakeContact -MailboxUserId 'u1' -DisplayName 'bob.ray (dupe)' -SourceId 'u2' -Hash 'stale'        # duplicate -> delete
         $null = Add-FakeContact -MailboxUserId 'u1' -DisplayName 'Lee Ver' -SourceId 'u-gone'                           # leaver -> delete
-        $null = Add-FakeContact -MailboxUserId 'u1' -DisplayName 'gus.ok' -SourceId 'u7' -Hash (Get-CurrentHash 'u7')   # current -> unchanged
+        $null = Add-FakeContact -MailboxUserId 'u1' -DisplayName 'gus.ok' -SourceId 'u7' -Hash (Get-CurrentHash 'u7') -Fields (Get-CurrentFields 'u7')   # current -> unchanged
         # Mailbox u2 pre-state: a card for themselves, written by an older version -> deleted
         $null = Add-FakeContact -MailboxUserId 'u2' -DisplayName 'bob.ray' -SourceId 'u2' -Hash (Get-CurrentHash 'u2')
         # Throttle the first create into u2 once
@@ -179,15 +189,33 @@ Describe 'Sync-DirectoryToMailboxes main flow' {
             $again.Summary.ContactsUnchanged | Should -Be 26
         }
 
-        It 'restores a contact a user edited on their phone and changes nothing else' {
+        It 'leaves a phone-side edit alone when DetectLocalEdits is off' {
+            # An edit on the phone changes the fields but not the stored hash (the phone never touches extended properties).
             $gus = @($global:FakeTenant.Mailboxes['u1'] | Where-Object { ($_.singleValueExtendedProperties | Where-Object { $_.id -match 'SourceId' }).value -eq 'u7' })[0]
             $gus.jobTitle = 'Edited on phone'
-            $gus.singleValueExtendedProperties = @($gus.singleValueExtendedProperties | ForEach-Object { if ($_.id -match 'SourceHash') { @{ id = $_.id; value = 'user-edited' } } else { $_ } })
+            $again = Invoke-Runbook -Parameters @{ WhatIf = $false; DetectLocalEdits = $false; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $again.Summary.ContactsUpdated | Should -Be 0
+            $gus.jobTitle | Should -Be 'Edited on phone'
+        }
+
+        It 'restores a contact a user edited on their phone and changes nothing else' {
+            $gus = @($global:FakeTenant.Mailboxes['u1'] | Where-Object { ($_.singleValueExtendedProperties | Where-Object { $_.id -match 'SourceId' }).value -eq 'u7' })[0]
+            $gus.jobTitle | Should -Be 'Edited on phone'
+            $hashBefore = ($gus.singleValueExtendedProperties | Where-Object { $_.id -match 'SourceHash' }).value
+            $hashBefore | Should -Be (Get-CurrentHash 'u7')                 # stored hash still says "current"
             $again = Invoke-Runbook -Parameters @{ WhatIf = $false; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
             $again.Summary.ContactsUpdated | Should -Be 1
+            $again.Summary.LocalEditsReverted | Should -Be 1
             $again.Summary.ContactsAdded | Should -Be 0
             $again.Summary.ContactsDeleted | Should -Be 0
+            ($again.Lines -join "`n") | Should -Match 'APPLY UPDATE mailbox=ann\.lee@contoso\.com .*gus\.ok@contoso\.com.*\(edited in mailbox\)'
             $gus.jobTitle | Should -Be 'Staff'
+        }
+
+        It 'does not see an edit after restoring it (no rewrite loop)' {
+            $again = Invoke-Runbook -Parameters @{ WhatIf = $false; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $again.Summary.ContactsUpdated | Should -Be 0
+            $again.Summary.LocalEditsReverted | Should -Be 0
         }
 
         It 'picks up a title change and a mobile number change on the next run' {
@@ -238,6 +266,63 @@ Describe 'Sync-DirectoryToMailboxes main flow' {
             $run.Summary.ContactsDeleted | Should -Be 26
             foreach ($box in 'u1', 'u2', 'u3', 'u7', 'u8') { @(Get-OwnedFakeContacts -MailboxUserId $box).Count | Should -Be 0 }
             @($global:FakeTenant.Mailboxes['u1'] | ForEach-Object displayName) | Should -Be @('Mom', 'Dentist')
+        }
+    }
+
+    Context 'Failure handling' {
+        BeforeAll {
+            function Invoke-RunbookCatching {
+                param([hashtable]$Parameters)
+                $collected = [System.Collections.Generic.List[object]]::new()
+                $thrown = $null
+                try { & $script:Runbook @Parameters 3>&1 | ForEach-Object { $collected.Add($_) } }
+                catch { $thrown = $_ }
+                [pscustomobject]@{
+                    Lines   = @($collected | Where-Object { $_ -is [string] })
+                    Summary = ($collected | Where-Object { $_ -isnot [string] -and $_ -isnot [System.Management.Automation.WarningRecord] } | Select-Object -Last 1)
+                    Error   = $thrown
+                }
+            }
+        }
+
+        It 'keeps going when a whole $batch call fails for one mailbox, then fails the job' {
+            $null = New-Scenario
+            $global:FakeTenant.BatchThrow = 400
+            $run = Invoke-RunbookCatching -Parameters @{ WhatIf = $false; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $run.Error | Should -Not -BeNullOrEmpty
+            "$($run.Error)" | Should -Match 'completed with 1 error'
+            $run.Summary | Should -Not -BeNullOrEmpty
+            $run.Summary.Errors | Should -Be 1
+            $run.Summary.MailboxesProcessed | Should -Be 4                  # the other four reachable mailboxes were still filled
+            ($run.Lines -join "`n") | Should -Match 'Writing contacts failed for ann\.lee@contoso\.com'
+            (Get-SourceIds 'u8') | Should -Be @('u1', 'u2', 'u5', 'u6', 'u7')
+        }
+
+        It 'retries a $batch call that fails with a transient 503' {
+            $null = New-Scenario
+            $global:FakeTenant.BatchThrow = 503
+            $run = Invoke-RunbookCatching -Parameters @{ WhatIf = $false; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $run.Error | Should -BeNullOrEmpty
+            $run.Summary.Errors | Should -Be 0
+            $run.Summary.MailboxesProcessed | Should -Be 5
+        }
+
+        It 'fails the job when every targeted mailbox returns 403 (broken RBAC assignment, not scope lag)' {
+            $null = New-Scenario
+            foreach ($id in 'u1', 'u2', 'u3', 'u5', 'u6', 'u7', 'u8') { $null = $global:FakeTenant.ForbiddenMailboxes.Add($id) }
+            $null = $global:FakeTenant.NoMailbox.Remove('u6')
+            $global:FakeTenant.Mailboxes['u6'] = [System.Collections.Generic.List[object]]::new()
+            $run = Invoke-RunbookCatching -Parameters @{ WhatIf = $true; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $run.Summary.MailboxesProcessed | Should -Be 0
+            $run.Summary.MailboxesSkipped.AccessDenied | Should -Be 7
+            "$($run.Error)" | Should -Match 'New-ExchangeAppScope\.ps1 -TestOnly'
+        }
+
+        It 'does not fail the job when only some mailboxes return 403' {
+            $null = New-Scenario
+            $run = Invoke-RunbookCatching -Parameters @{ WhatIf = $true; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $run.Error | Should -BeNullOrEmpty
+            $run.Summary.MailboxesSkipped.AccessDenied | Should -Be 1
         }
     }
 

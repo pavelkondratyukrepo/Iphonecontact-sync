@@ -12,7 +12,9 @@
     What it creates
       1. Dynamic security group (default SG-CorpiPhone-Users) with rule (user.extensionAttribute1 -eq "CorpiPhone")
          and the static exclusion group (default SG-Directory-Exclude).
-      2. Resource group and Automation account (Free plan) with a system-assigned managed identity.
+      2. Resource group and Automation account (Basic plan) with a system-assigned managed identity. Basic includes the
+         same 500 free job minutes a month as Free (expected use is 60 to 80), but keeps running past them at a tiny
+         per-minute rate instead of refusing to run jobs for the rest of the month.
       3. Four Microsoft Graph application permissions on the identity:
              DeviceManagementManagedDevices.Read.All, User.ReadWrite.All, GroupMember.Read.All, RoleManagement.Read.Directory
          Deliberately NOT Contacts.ReadWrite. Microsoft documents that Entra grants and Exchange RBAC for Applications
@@ -299,10 +301,10 @@ if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyCont
 }
 else { Write-Host '  exists' }
 
-Write-Step "Ensuring Automation account '$AutomationAccountName' (Free plan, system-assigned identity)"
+Write-Step "Ensuring Automation account '$AutomationAccountName' (Basic plan, system-assigned identity)"
 $aa = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
 if (-not $aa) {
-    $aa = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -Location $Location -Plan Free -AssignSystemIdentity
+    $aa = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -Location $Location -Plan Basic -AssignSystemIdentity
     Write-Host '  created'
 }
 elseif (-not $aa.Identity -or -not $aa.Identity.PrincipalId) {
@@ -310,6 +312,10 @@ elseif (-not $aa.Identity -or -not $aa.Identity.PrincipalId) {
     Write-Host '  exists, enabled system-assigned identity'
 }
 else { Write-Host '  exists' }
+$planProperty = $aa.PSObject.Properties['Plan']
+if ($planProperty -and [string]$planProperty.Value -eq 'Free') {
+    Write-Warning "Automation account '$AutomationAccountName' is on the Free plan: once 500 job minutes are used in a month, jobs stop running until the next month. Switch it to Basic (portal: the account > Pricing) to avoid a silent outage; normal use stays inside the free minutes."
+}
 
 $identityObjectId = $aa.Identity.PrincipalId
 if (-not $identityObjectId) {

@@ -302,12 +302,15 @@ function ConvertTo-UserRecord {
     if ($null -eq $upn) { $upn = Get-Field -Object $User -Name 'UserPrincipalName' }
     $mobile = Get-Field -Object $User -Name 'mobilePhone'
     if ($null -eq $mobile) { $mobile = Get-Field -Object $User -Name 'MobilePhone' }
+    $synced = Get-Field -Object $User -Name 'onPremisesSyncEnabled'
+    if ($null -eq $synced) { $synced = Get-Field -Object $User -Name 'OnPremisesSyncEnabled' }
     [pscustomobject]@{
         Id                = [string]$id
         UserPrincipalName = [string]$upn
         AccountEnabled    = [bool]$enabled
         ScopeAttribute    = if ([string]::IsNullOrEmpty([string]$attrValue)) { $null } else { [string]$attrValue }
         MobilePhone       = if ([string]::IsNullOrEmpty([string]$mobile)) { $null } else { [string]$mobile }
+        SyncedFromOnPrem  = ($synced -eq $true)
     }
 }
 
@@ -480,17 +483,25 @@ Write-SyncLog "Read $($allDevices.Count) corporate iOS devices: $($devices.Count
 
 # --- 2. users --------------------------------------------------------------------------------------------------------
 # All users are read and guests dropped client-side: a userType filter would miss older accounts whose userType is null.
-$rawUsers = @(Get-MgUser -All -PageSize 999 -Property Id, UserPrincipalName, AccountEnabled, MobilePhone, UserType, OnPremisesExtensionAttributes)
-$users = @($rawUsers | Where-Object { [string](Get-Field -Object $_ -Name 'UserType') -ne 'Guest' } | ForEach-Object { ConvertTo-UserRecord -User $_ -AttributeName $ScopeAttributeName })
+$rawUsers = @(Get-MgUser -All -PageSize 999 -Property Id, UserPrincipalName, AccountEnabled, MobilePhone, UserType, OnPremisesExtensionAttributes, OnPremisesSyncEnabled)
+$allMembers = @($rawUsers | Where-Object { [string](Get-Field -Object $_ -Name 'UserType') -ne 'Guest' } | ForEach-Object { ConvertTo-UserRecord -User $_ -AttributeName $ScopeAttributeName })
+# Users synced from on-premises AD are hands-off: Graph cannot write their extension attributes or mobilePhone (AD is
+# the source), so the runbook neither stamps, unstamps nor writes numbers for them. The design assumes cloud-only users.
+$syncedIds = [System.Collections.Generic.HashSet[string]]::new([string[]]@($allMembers | Where-Object { $_.SyncedFromOnPrem } | ForEach-Object { $_.Id.ToLowerInvariant() }), [StringComparer]::OrdinalIgnoreCase)
+$users = @($allMembers | Where-Object { -not $_.SyncedFromOnPrem })
 $userById = @{}
 foreach ($u in $users) { $userById[$u.Id.ToLowerInvariant()] = $u }
 $knownUserIds = [System.Collections.Generic.HashSet[string]]::new([string[]]$userById.Keys, [StringComparer]::OrdinalIgnoreCase)
-Write-SyncLog "Read $($users.Count) member users ($($rawUsers.Count - $users.Count) guests ignored)"
+Write-SyncLog "Read $($users.Count) cloud member users ($($rawUsers.Count - $allMembers.Count) guests and $($syncedIds.Count) users synced from on-premises AD ignored)"
 
 $inScopeIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $skippedUserKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($d in $withUser) {
     $key = $d.UserId.ToLowerInvariant()
+    if ($syncedIds.Contains($key)) {
+        if ($skippedUserKeys.Add($key)) { Add-Skip -Reason 'SyncedFromOnPremises' -Detail "primary user $($d.UserPrincipalName) of device '$($d.DeviceName)' serial $($d.SerialNumber) is synced from on-premises AD; Graph cannot write their attributes. Set $ScopeAttributeName and the mobile number in AD, or make the account cloud-only." }
+        continue
+    }
     if (-not $userById.ContainsKey($key)) {
         if ($skippedUserKeys.Add($key)) { Add-Skip -Reason 'DeviceUserNotMember' -Detail "primary user $($d.UserPrincipalName) ($($d.UserId)) of device '$($d.DeviceName)' serial $($d.SerialNumber) is not a member user (guest or deleted)" }
         continue

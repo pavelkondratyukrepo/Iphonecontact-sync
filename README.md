@@ -110,7 +110,7 @@ Both end with a summary object and throw if any error occurred, so the job shows
 4. APP and ACP assigned to the pilot group. Users tap Allow; an existing Outlook contact appears in native Contacts.
 5. Runbook 2 with `WhatIf` for one user, review, run live. Company Directory contacts appear in Outlook and native Contacts; a test call from a coworker resolves caller ID. Then run for the full group.
 6. Leaver test: retire a spare test phone, run Runbook 1, stamp clears and the test user leaves the group; run Runbook 2, their contact is gone from other phones.
-7. Edit test: a user edits a directory contact on the phone; next run logs one `UPDATE ... (edited in mailbox)` and restores it, nothing else changes. Run again at once: `Updated=0`. If unrelated cards show `edited in mailbox` on every run, set `DetectLocalEdits = false`.
+7. Edit test: edit a directory contact in Outlook on the web (not the iPhone Contacts app, whose edits Outlook may simply overwrite); next run logs one `UPDATE ... (edited in mailbox)` and restores it, nothing else changes. Run again at once: `Updated=0`. If unrelated cards show `edited in mailbox` on every run, set `DetectLocalEdits = false`.
 8. Schedules enabled, alert rule on, three clean weeks.
 
 Exit criteria: Runbook 1's stamped set matches Intune's corporate iPhone primary users exactly, zero unexplained skips, each member's mailbox holds group size minus one runbook-owned contacts, users confirm caller ID, both schedules have run clean for three weeks.
@@ -140,6 +140,8 @@ Intune cannot change the primary user of an iOS device (that action is Windows o
 ## Troubleshooting
 
 **Phone has no primary user.** Runbook 1 logs `Device '<name>' serial <serial> has no primary user and is ignored` and counts it in `DevicesWithoutPrimaryUser`. The line is a warning, so it is on the job's **Warnings** tab, not Output. Retire the phone and enroll it again with its user signing in (Intune cannot set an iOS primary user in place). The user is stamped on the next run.
+
+**User synced from on-premises AD.** Skip reason `SyncedFromOnPremises`. Graph cannot write extension attributes or `mobilePhone` for AD-mastered users, so Runbook 1 leaves them completely alone (no stamp, no unstamp, no number). The design assumes cloud-only users; for a synced user, set `extensionAttribute1` and the mobile number in AD, or convert the account to cloud-only.
 
 **Device reports no phone number.** Skip reason `NoPhoneNumber`. Intune collects hardware inventory about every 7 days, so a fresh enrollment may show its primary user before its number; the stamp lands first and the number follows. Some carriers and eSIM profiles never report a number. The user stays in the directory without a mobile number. Set `mobilePhone` by hand if you need it sooner.
 

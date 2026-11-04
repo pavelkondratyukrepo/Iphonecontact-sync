@@ -207,6 +207,20 @@ Describe 'Sync-IntuneToEntra main flow' {
             ($run.Lines -join "`n") | Should -Match 'new@contoso\.com mobilePhone \+18045550101 -> \(none\) \(number now belongs to hire@contoso\.com\)'
         }
 
+        It 'leaves users synced from on-premises AD alone: no stamp, no unstamp, no phone write, no error' {
+            $null = New-Scenario
+            $null = Add-FakeUser -Id 'u-hybrid' -Upn 'hybrid@contoso.com' -Extra @{ onPremisesSyncEnabled = $true }
+            Add-FakeDevice -UserId 'u-hybrid' -Upn 'hybrid@contoso.com' -Phone '8045550120' -Serial 'S-HYB'
+            $null = Add-FakeUser -Id 'u-hybrid-old' -Upn 'hybridold@contoso.com' -Ext1 'CorpiPhone' -Extra @{ onPremisesSyncEnabled = $true }   # stamped in AD, no device
+            $run = Invoke-Runbook -Parameters @{ WhatIf = $false; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $run.Summary.Errors | Should -Be 0
+            $run.Summary.UsersSkipped.SyncedFromOnPremises | Should -Be 1
+            (Get-Ext1 'u-hybrid') | Should -BeNullOrEmpty
+            (Get-Mobile 'u-hybrid') | Should -BeNullOrEmpty
+            (Get-Ext1 'u-hybrid-old') | Should -Be 'CorpiPhone'
+            @($global:FakeTenant.Patches | Where-Object { $_.UserId -like 'u-hybrid*' }).Count | Should -Be 0
+        }
+
         It 'keeps the stamp and records a skip, not an error, when Graph refuses a phone write with 403' {
             $null = New-Scenario
             ($global:FakeTenant.Users | Where-Object { $_.id -eq 'u-two' }).onPremisesExtensionAttributes.extensionAttribute1 = 'CorpiPhone'   # already stamped: only the phone write happens

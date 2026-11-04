@@ -88,6 +88,7 @@ Azure Automation passes bools and strings, not switches. Both runbooks default t
 | `ExclusionGroupName` | `SG-Directory-Exclude` | Members keep the stamp but their number is not written. Empty disables. |
 | `DefaultCountryCode` | `+1` | Prefix for 10-digit numbers. |
 | `ScopeAttributeValue` | `CorpiPhone` | Value written to `extensionAttribute1`. |
+| `AllowMassUnstamp` | `false` | Circuit breaker override. Without it the runbook refuses to unstamp anyone when Intune returns zero corporate iPhones, or when more than max(3, 25% of stamped users) would be unstamped in one run, and fails the job listing `WOULD UNSTAMP` lines. Set it only for one manual run after confirming the change is real (a large offboarding). |
 
 **Sync-DirectoryToMailboxes**
 
@@ -142,6 +143,8 @@ Intune cannot change the primary user of an iOS device (that action is Windows o
 **Phone has no primary user.** Runbook 1 logs `Device '<name>' serial <serial> has no primary user and is ignored` and counts it in `DevicesWithoutPrimaryUser`. The line is a warning, so it is on the job's **Warnings** tab, not Output. Retire the phone and enroll it again with its user signing in (Intune cannot set an iOS primary user in place). The user is stamped on the next run.
 
 **User synced from on-premises AD.** Skip reason `SyncedFromOnPremises`. Graph cannot write extension attributes or `mobilePhone` for AD-mastered users, so Runbook 1 leaves them completely alone (no stamp, no unstamp, no number). The design assumes cloud-only users; for a synced user, set `extensionAttribute1` and the mobile number in AD, or convert the account to cloud-only.
+
+**Runbook 1 fails with "Mass unstamp refused".** The circuit breaker stopped the run before any write, because the device read looked broken (zero corporate iPhones from Intune, or more than a quarter of tagged users about to lose the tag). Read the `WOULD UNSTAMP` lines. If Intune or Graph had an outage, do nothing; the next run fixes itself. If the change is real (for example a department returning phones), start the runbook once by hand with `WhatIf = false` and `AllowMassUnstamp = true`.
 
 **Device reports no phone number.** Skip reason `NoPhoneNumber`. Intune collects hardware inventory about every 7 days, so a fresh enrollment may show its primary user before its number; the stamp lands first and the number follows. Some carriers and eSIM profiles never report a number. The user stays in the directory without a mobile number. Set `mobilePhone` by hand if you need it sooner.
 

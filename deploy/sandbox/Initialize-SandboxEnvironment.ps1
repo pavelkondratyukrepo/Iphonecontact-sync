@@ -53,7 +53,7 @@ $GitHubToken        = $env:CORPIPHONE_GITHUB_TOKEN   # set this environment vari
 
 # Fallback versions if the GitHub API cannot be reached to resolve the newest 7.6.x / Git release.
 # PowerShell 7.6 is the current LTS; 7.4 reaches end of support on 10 November 2026. The deploy scripts and the tests
-# run on any 7.4 or later, so the workstation uses the supported LTS even while Azure Automation still runs 7.4.
+# run on any 7.4 or later; the runbooks run on the Azure Automation 7.6 runtime too.
 $PwshFallbackVersion = '7.6.6'
 $GitFallbackTag      = 'v2.56.0.windows.1'
 

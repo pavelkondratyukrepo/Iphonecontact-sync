@@ -18,9 +18,9 @@ Intune managedDevice (primary user, phoneNumber)
 
 | Path | Purpose |
 | --- | --- |
-| `runbooks/Sync-IntuneToEntra.ps1` | Runbook 1: scope stamp and phone number. Azure Automation, PowerShell 7.4, managed identity. |
+| `runbooks/Sync-IntuneToEntra.ps1` | Runbook 1: scope stamp and phone number. Azure Automation, PowerShell 7.6 runtime, managed identity. |
 | `runbooks/Sync-DirectoryToMailboxes.ps1` | Runbook 2: directory to mailbox contacts. Same runtime. |
-| `deploy/Deploy-Automation.ps1` | One-time: groups, Automation account, identity, Graph permissions, 7.4 runtime environment with pinned modules, runbooks, schedules, alert. |
+| `deploy/Deploy-Automation.ps1` | One-time: groups, Automation account, identity, Graph permissions, PowerShell 7.6 runtime environment with pinned modules, runbooks, schedules, alert. |
 | `deploy/New-ExchangeAppScope.ps1` | One-time, Exchange Administrator: service principal, management scope, scoped `Application Contacts.ReadWrite`, authorization test, Entra permission check. |
 | `deploy/New-OutlookContactSyncPolicies.ps1` | One-time, Intune Administrator: iOS APP and Outlook ACP, assigned to a group. |
 | `deploy/sandbox/` | Windows Sandbox bootstrap (paste-and-go PowerShell 5.1 script) and a `.wsb` that runs it at logon. |
@@ -34,7 +34,7 @@ Everything tenant-specific (ids, names, addresses) is a script parameter. Nothin
 
 Follow the Deployment guide for the hands-on steps. The order is dictated by the data flow:
 
-1. `deploy/Deploy-Automation.ps1` creates the groups, the Automation account with its system-assigned managed identity, the four Graph application permissions, the PowerShell 7.4 runtime environment with `Microsoft.Graph` pinned to 2.40.0, imports and publishes both runbooks, creates the schedules (disabled) and the alert rule. It prints the identity's application id and object id.
+1. `deploy/Deploy-Automation.ps1` creates the groups, the Automation account with its system-assigned managed identity, the four Graph application permissions, the PowerShell 7.6 runtime environment (`-PowerShellVersion 7.4` as a fallback) with `Microsoft.Graph` pinned to 2.40.0, imports and publishes both runbooks, creates the schedules (disabled) and the alert rule. It prints the identity's application id and object id.
 2. `deploy/New-ExchangeAppScope.ps1` registers the identity in Exchange Online, creates the `CorpiPhoneMailboxes` scope on `CustomAttribute1 -eq 'CorpiPhone'`, assigns `Application Contacts.ReadWrite` restricted to it, runs `Test-ServicePrincipalAuthorization`, and checks Entra for a `Contacts.*` grant that must not exist.
 3. Runbook 1 `Sync-IntuneToEntra`, first with `WhatIf = true`, then live. The stamp and the dynamic group now exist.
 4. `deploy/New-OutlookContactSyncPolicies.ps1` creates the APP and ACP and assigns them to a pilot group, later to `SG-CorpiPhone-Users`.
@@ -171,7 +171,7 @@ Intune cannot change the primary user of an iOS device (that action is Windows o
 
 **Duplicate contacts.** Two kinds. Duplicates among runbook-owned contacts (same `DirectorySourceId`) are deleted automatically on the next run; the log shows `DELETE ... (duplicate)`. Duplicates between a runbook contact and a personal contact the user created themselves are expected and untouched; the user can delete their own copy. If the native app shows a coworker twice with the same data, check that Outlook is not also syncing contacts from a second account.
 
-**PowerShell 7.4 end of support (10 November 2026).** The runbooks run in an Azure Automation PowerShell 7.4 runtime environment. When Azure Automation offers a newer runtime (7.6), create a second runtime environment on it with the same pinned modules, run both runbooks there with `WhatIf = true`, then point the runbooks at it with `Deploy-Automation.ps1 -RuntimeEnvironmentName <new name>`. Nothing in the runbooks is specific to 7.4. The admin workstation (Sandbox script) already installs 7.6 LTS.
+**PowerShell runtime version.** PowerShell 7.4 reaches end of support on 10 November 2026, and Azure Automation follows that lifecycle, so the deploy script now creates a PowerShell 7.6 runtime environment (`PowerShell76-GraphSync`). An account deployed earlier on 7.4 moves by re-running `Deploy-Automation.ps1` with the same parameters: it creates the 7.6 environment, imports the pinned modules and moves both runbooks into it. 2.40.0 is proven on 7.4, not yet on 7.6: the first `WhatIf = true` job of each runbook is the test. If it fails to load a `Microsoft.Graph` module, re-run the deploy script with `-PowerShellVersion 7.4` to move the runbooks back, then test a newer pinned Graph version in a separate 7.6 environment.
 
 **Module import failures in Automation.** The runtime environment must be PowerShell 7.4 or later (7.2 is .NET 6 and current Graph SDK modules fail to load there) and every `Microsoft.Graph.*` package must show provisioning state Succeeded at the same version. 2.40.0 is known good; 2.41.0 and 2.41.1 fail. Never update the pinned version in place: create a second runtime environment with the candidate version, point a test copy of the runbook at it, and switch only when it runs clean. Import order matters: `Microsoft.Graph.Authentication` first.
 

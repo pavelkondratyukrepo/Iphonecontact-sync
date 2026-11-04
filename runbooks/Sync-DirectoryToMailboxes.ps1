@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Azure Automation runbook (PowerShell 7.4). Writes one tagged "Company Directory" contact per coworker into the
+    Azure Automation runbook (PowerShell 7.6 runtime; also runs on 7.4). Writes one tagged "Company Directory" contact per coworker into the
     default Contacts folder of every member of the control group, through Microsoft Graph, and keeps them current.
 
 .DESCRIPTION

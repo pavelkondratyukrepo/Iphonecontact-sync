@@ -3,7 +3,7 @@
 <#
 .SYNOPSIS
     One-time deployment of the CorpiPhone directory sync: groups, Automation account, managed identity,
-    Graph permissions, PowerShell 7.4 runtime environment, runbooks, schedules and alerting.
+    Graph permissions, PowerShell 7.6 runtime environment, runbooks, schedules and alerting.
 
 .DESCRIPTION
     Run once from an admin workstation. Idempotent: every step checks for the resource before creating it,
@@ -19,8 +19,9 @@
              DeviceManagementManagedDevices.Read.All, User.ReadWrite.All, GroupMember.Read.All, RoleManagement.Read.Directory
          Deliberately NOT Contacts.ReadWrite. Microsoft documents that Entra grants and Exchange RBAC for Applications
          grants are a union, so an unscoped Entra grant would defeat the mailbox scope created by New-ExchangeAppScope.ps1.
-      4. A PowerShell 7.4 runtime environment with the Microsoft.Graph submodules the runbooks need, pinned to
-         -GraphModuleVersion. The 7.2 runtime is .NET 6 and cannot load current Graph SDK modules.
+      4. A PowerShell runtime environment (7.6 by default; 7.4 reaches end of support on 10 November 2026) with the
+         Microsoft.Graph submodules the runbooks need, pinned to -GraphModuleVersion. Re-running with a different
+         -PowerShellVersion creates the new environment and moves both runbooks into it; the old one is left in place.
       5. Both runbooks imported and published into that runtime environment.
       6. Schedules (daily 05:00 and weekly Monday 08:00 in -ScheduleTimeZone) linked to the runbooks with
          WhatIf = $false. New schedules are created disabled unless -EnableSchedules is passed; a re-run without the
@@ -52,10 +53,13 @@
     Value written to the stamp attribute. Default CorpiPhone.
 .PARAMETER GraphModuleVersion
     Microsoft.Graph SDK version pinned into the runtime environment. 2.40.0 is known to load on the 7.4 runtime;
-    2.41.0 and 2.41.1 are known to fail. Before changing it, check the PowerShell Gallery and the Azure Automation
-    release notes for the newest version confirmed to load in Automation 7.4, and test in a second runtime environment.
+    2.41.0 and 2.41.1 are known to fail there. Before changing it, check the PowerShell Gallery and the Azure Automation
+    release notes for the newest version confirmed to load, and test in a second runtime environment.
+.PARAMETER PowerShellVersion
+    Runtime version, 7.6 (default) or 7.4. If the first WhatIf job on 7.6 fails to load a Microsoft.Graph module, re-run
+    with -PowerShellVersion 7.4 to move the runbooks back, and plan the move to 7.6 with a newer pinned Graph version.
 .PARAMETER RuntimeEnvironmentName
-    Name of the PowerShell 7.4 runtime environment. Default PowerShell74-GraphSync.
+    Name of the runtime environment. Default PowerShell76-GraphSync (PowerShell74-GraphSync for -PowerShellVersion 7.4).
 .PARAMETER ScheduleTimeZone
     IANA time zone for the schedules. Default America/New_York.
 .PARAMETER RunbookDirectory
@@ -90,7 +94,8 @@ param(
     [ValidatePattern('^extensionAttribute([1-9]|1[0-5])$')] [string]$ScopeAttributeName = 'extensionAttribute1',
     [ValidatePattern('^[A-Za-z0-9_-]{1,64}$')] [string]$ScopeAttributeValue = 'CorpiPhone',
     [string]$GraphModuleVersion = '2.40.0',
-    [string]$RuntimeEnvironmentName = 'PowerShell74-GraphSync',
+    [ValidateSet('7.6', '7.4')] [string]$PowerShellVersion = '7.6',
+    [string]$RuntimeEnvironmentName = '',
     [string]$ScheduleTimeZone = 'America/New_York',
     [string]$RunbookDirectory = (Join-Path $PSScriptRoot '..' 'runbooks'),
     [switch]$DeferSchedules,
@@ -368,27 +373,28 @@ if ($badAssignments) {
 else { Write-Host '  verified: no Contacts.* permission on the identity (contacts access comes only from Exchange RBAC)' }
 
 # ----------------------------------------------------------------------------------------------------------------
-# 4. PowerShell 7.4 runtime environment with pinned Microsoft.Graph modules
+# 4. PowerShell runtime environment with pinned Microsoft.Graph modules
 # ----------------------------------------------------------------------------------------------------------------
 $aaPath = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName"
+if ([string]::IsNullOrWhiteSpace($RuntimeEnvironmentName)) { $RuntimeEnvironmentName = "PowerShell$($PowerShellVersion -replace '\.', '')-GraphSync" }
 $rtPath = "$aaPath/runtimeEnvironments/$RuntimeEnvironmentName"
 
-Write-Step "Ensuring PowerShell 7.4 runtime environment '$RuntimeEnvironmentName'"
+Write-Step "Ensuring PowerShell $PowerShellVersion runtime environment '$RuntimeEnvironmentName'"
 $rt = Get-ArmOrNull -Path "$rtPath`?api-version=$AutomationApiVersion"
 if (-not $rt) {
     $null = Invoke-Arm -Method PUT -Path "$rtPath`?api-version=$AutomationApiVersion" -Body @{
         location   = $Location
         properties = @{
-            runtime         = @{ language = 'PowerShell'; version = '7.4' }
+            runtime         = @{ language = 'PowerShell'; version = $PowerShellVersion }
             defaultPackages = @{}
-            description     = "PowerShell 7.4 with Microsoft.Graph $GraphModuleVersion for the CorpiPhone directory sync runbooks."
+            description     = "PowerShell $PowerShellVersion with Microsoft.Graph $GraphModuleVersion for the CorpiPhone directory sync runbooks."
         }
     }
     Write-Host '  created'
 }
 else {
     $rtVersion = $rt.properties.runtime.version
-    if ($rtVersion -ne '7.4') { throw "Runtime environment '$RuntimeEnvironmentName' exists but is PowerShell $rtVersion, not 7.4. Pass a different -RuntimeEnvironmentName." }
+    if ($rtVersion -ne $PowerShellVersion) { throw "Runtime environment '$RuntimeEnvironmentName' exists but is PowerShell $rtVersion, not $PowerShellVersion. Pass a different -RuntimeEnvironmentName." }
     Write-Host '  exists'
 }
 

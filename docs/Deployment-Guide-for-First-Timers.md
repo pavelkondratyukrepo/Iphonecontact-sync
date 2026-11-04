@@ -210,7 +210,7 @@ The other two names, `rg-corpiphone-sync` and `aa-corpiphone-sync`, are suggesti
 | `Waiting for the identity's service principal` | Azure is publishing the account's login to Entra | up to 2 minutes |
 | `Granting Graph application permissions` | Four lines starting with `granted` (or `exists` on a re-run) | seconds |
 | `verified: no Contacts.* permission` | Important safety check passed. If the script stops here with red text about an unscoped Contacts permission, remove it as the text says and run again |  |
-| `Ensuring PowerShell 7.4 runtime environment` | Creates the engine the runbooks run on | seconds |
+| `Ensuring PowerShell 7.6 runtime environment` | Creates the engine the runbooks run on | seconds |
 | `Adding Microsoft.Graph 2.40.0 modules` | Five lines, each ending `imported`. **This is the slow part.** | 2 to 4 minutes each |
 | `Importing and publishing runbooks` | Two lines ending `published` | 1 minute |
 | `Ensuring schedules` | Creates both schedules and ends with `schedules created DISABLED` | seconds |
@@ -569,7 +569,7 @@ Find the message or symptom you are seeing in the left column. Everything here h
 | Phone: Outlook shows the contacts but the iPhone Contacts app does not | One of four switches is off | 1. Outlook on the phone: profile icon, gear, the account, **Save Contacts** must be on. 2. iPhone **Settings**, **Outlook**, **Contacts** must be on. 3. Intune: the App Protection Policy must have **Sync policy managed app data with native apps** = Allow and be assigned to the user. 4. Step 4.4's device restriction must not say Block. Then close and reopen Outlook. |
 | Phone: the user tapped Don't Allow | iOS permission denied | Outlook, profile icon, gear, the account, **Open Settings** under Save Contacts, switch Contacts on. |
 | Phone: a coworker appears twice | Either the user also saved that person as a personal contact (fine, they can delete their copy), or two runbook cards exist for one person | The Monday run deletes duplicate runbook cards by itself. Personal duplicates are the user's to clean up. |
-| Job **Failed**, Errors tab mentions `could not load` a Microsoft.Graph module | The runtime environment lost a module or someone changed its version | Run the Step 1 command again; it re-imports the pinned version. Never update modules in place. |
+| Job **Failed**, Errors tab mentions `could not load` a Microsoft.Graph module | On the very first run: the pinned Graph version does not load on PowerShell 7.6. Later: the runtime environment lost a module or someone changed its version | First run: run the Step 1 command again with `-PowerShellVersion 7.4` added; it moves the runbooks to a 7.4 environment. Later: run the Step 1 command again unchanged; it re-imports the pinned version. Never update modules in place. Tell the repo maintainer either way. |
 | Job Output has yellow `throttled, retrying` lines | Microsoft slowed the script down briefly. It waited and continued | Nothing. Only a job that ends **Failed** with `still throttled` needs a re-run. |
 | Job **Failed** but the output shows a summary with `Errors=` bigger than 0 | Some changes failed, the rest were applied | Read the error lines above the summary, fix the cause, start the job again. Re-running is always safe; it only touches what is still wrong. |
 

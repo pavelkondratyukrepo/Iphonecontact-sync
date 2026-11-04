@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Azure Automation runbook (PowerShell 7.4). Reads corporate-owned iPhones and their primary users from Intune,
+    Azure Automation runbook (PowerShell 7.6 runtime; also runs on 7.4). Reads corporate-owned iPhones and their primary users from Intune,
     stamps those users as in scope (extensionAttribute1 = CorpiPhone) and writes each phone's number to the
     user's mobilePhone attribute in Entra ID.
 

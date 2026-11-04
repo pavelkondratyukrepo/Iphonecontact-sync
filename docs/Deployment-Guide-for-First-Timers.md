@@ -488,6 +488,7 @@ Let both schedules run on their own. On the following Monday afternoon, open the
 - [ ] Both schedules show **Enabled: Yes**.
 - [ ] Both linked schedules have **WHATIF = False**.
 - [ ] The test failure email arrived.
+- [ ] The first scheduled job of each runbook: its **Output** starts with a line containing `Mode=APPLY` (not `Mode=WHATIF`). If it says WHATIF, the schedule's WHATIF setting did not arrive as False; fix it on the schedule's parameters.
 - [ ] After a week, all scheduled jobs are Completed.
 
 ## Step 7: Roll out to everyone

@@ -43,7 +43,7 @@ Follow the Deployment guide for the hands-on steps. The order is dictated by the
 
 ### Running from Windows Sandbox
 
-Windows Sandbox starts clean every time (PowerShell 5.1 only, no modules, no cached account). `deploy/sandbox/Initialize-SandboxEnvironment.ps1` turns it into a ready admin workstation: paste the whole file into the Windows PowerShell window the Sandbox opens. It installs PowerShell 7.4 and Git, clones this repo, installs the exact module set into PowerShell 7 (Graph pinned to the runtime environment's version), disables broker sign-in, runs the Pester suite and opens a PowerShell 7 window in the repo. About 10 to 15 minutes. Edit the configuration block at the top first if the branch name or repo URL changed.
+Windows Sandbox starts clean every time (PowerShell 5.1 only, no modules, no cached account). `deploy/sandbox/Initialize-SandboxEnvironment.ps1` turns it into a ready admin workstation: paste the whole file into the Windows PowerShell window the Sandbox opens. It installs PowerShell 7.6 LTS and Git, clones this repo (default branch unless `$RepoBranch` is set), installs the exact module set into PowerShell 7 (Graph pinned to the runtime environment's version), disables broker sign-in, runs the Pester suite and opens a PowerShell 7 window in the repo. About 10 to 15 minutes. Edit the configuration block at the top first if the repo URL changed or you want to test a branch other than the default.
 
 To automate it, copy the script into a host folder, point `deploy/sandbox/CorpiPhone-Sync.wsb` at that folder and double-click the `.wsb`; the Sandbox runs the setup at logon.
 
@@ -95,18 +95,19 @@ Azure Automation passes bools and strings, not switches. Both runbooks default t
 | `ExclusionGroupName` | `SG-Directory-Exclude` | Removed from the directory, still receive contacts. |
 | `UserPrincipalName` | empty | Process only this member's mailbox (onboarding). |
 | `FullRebuild` | `false` | Rewrite every owned contact regardless of the stored hash. |
+| `DetectLocalEdits` | `true` | Also rewrite owned contacts whose fields were edited on the phone or in Outlook. Turn off only if the pilot shows Exchange reformatting a field (every card rewritten each run). |
 
-Both end with a summary object and throw if any error occurred, so the job shows Failed and the alert fires.
+Both end with a summary object and throw if any error occurred, so the job shows Failed and the alert fires. Runbook 2 also fails when every targeted mailbox was skipped with 403 (a broken Exchange assignment, not scope lag) and when it reaches its 150-minute time budget before the Automation 3-hour limit; the alert additionally fires on jobs that end Stopped. Do not start a manual full run of Runbook 2 while the Monday run is active: overlapping runs can create a duplicate card, which the next run removes.
 
 ## Pilot checklist
 
 1. Groups, Automation account, identity, the four Graph permissions and the Exchange scope created. Confirm `Contacts.ReadWrite` is absent from the identity's Entra permissions (Enterprise applications > the identity > Permissions).
-2. Runbook 1 with `WhatIf`: the stamp list matches the corporate iPhone primary users in Intune exactly. Fix primary users in Intune where wrong. Run live. Dynamic group fills within minutes.
+2. Runbook 1 with `WhatIf`: the stamp list matches the corporate iPhone primary users in Intune exactly. Fix primary users in Intune where wrong (retire and re-enroll; see Phone handover). Read the job's Warnings tab for phones without a primary user. Run live. Dynamic group fills within minutes.
 3. `Test-ServicePrincipalAuthorization` (re-run `New-ExchangeAppScope.ps1 -TestOnly`) shows the Contacts role in scope for a stamped user and not for an unstamped one.
 4. APP and ACP assigned to the pilot group. Users tap Allow; an existing Outlook contact appears in native Contacts.
 5. Runbook 2 with `WhatIf` for one user, review, run live. Company Directory contacts appear in Outlook and native Contacts; a test call from a coworker resolves caller ID. Then run for the full group.
-6. Leaver test: change a test phone's primary user or retire it, run Runbook 1, stamp clears and user leaves the group; run Runbook 2, their contact is gone from other phones.
-7. Edit test: a user edits a directory contact; next run restores it, nothing else changes.
+6. Leaver test: retire a spare test phone, run Runbook 1, stamp clears and the test user leaves the group; run Runbook 2, their contact is gone from other phones.
+7. Edit test: a user edits a directory contact on the phone; next run logs one `UPDATE ... (edited in mailbox)` and restores it, nothing else changes. Run again at once: `Updated=0`. If unrelated cards show `edited in mailbox` on every run, set `DetectLocalEdits = false`.
 8. Schedules enabled, alert rule on, three clean weeks.
 
 Exit criteria: Runbook 1's stamped set matches Intune's corporate iPhone primary users exactly, zero unexplained skips, each member's mailbox holds group size minus one runbook-owned contacts, users confirm caller ID, both schedules have run clean for three weeks.
@@ -119,7 +120,7 @@ To skip the wait: after Runbook 1 has run (and at least 30 minutes have passed f
 
 ## Phone handover
 
-Change the device's primary user in Intune. Runbook 1 moves the stamp on its next run: the old holder is unstamped (and drops out of the group, the policies and the Exchange scope), the new holder is stamped. Runbook 2 removes the old holder's card from everyone else and adds the new one on Monday, or sooner if you start it by hand.
+Intune cannot change the primary user of an iOS device (that action is Windows only), so retire or wipe the phone and enroll it again with the new holder signing in (for Automated Device Enrollment, a profile with user affinity). Runbook 1 moves the stamp on its next run: the old holder is unstamped (and drops out of the group, the policies and the Exchange scope), the new holder is stamped. Runbook 2 removes the old holder's card from everyone else and adds the new one on Monday, or sooner if you start it by hand. The old holder's own mailbox keeps the cards it already had: once unstamped it is outside the Exchange scope, so the runbook cannot reach it. Outlook on the retired phone is removed with its synced contacts; in the mailbox the user (or an admin) can delete the contacts in the **Company Directory** category. Leave personal contacts alone: only cards in that category came from the runbook.
 
 ## User notice (send when widening to the full group)
 
@@ -130,12 +131,12 @@ Change the device's primary user in Intune. Runbook 1 moves the stamp on its nex
 - Stop contacts arriving: disable the two schedules.
 - Remove the directory from phones: unassign the ACP, or set Save Contacts to off in it. Outlook stops syncing and removes the native entries on the next policy refresh.
 - Remove the contacts from mailboxes while keeping scope: nest `SG-CorpiPhone-Users` inside `SG-Directory-Exclude` (exclusions are read transitively), start `Sync-DirectoryToMailboxes` live once. With everyone excluded the directory is empty, so the runbook deletes every tagged contact and touches nothing else. Then remove the nesting.
-- Remove the stamp: clear `extensionAttribute1` on the users. The dynamic group empties and the Exchange scope matches nobody.
+- Remove the stamp (only after the step above, since the runbook can no longer reach an unstamped mailbox): clear `extensionAttribute1` on the users with `Update-MgUser -UserId <id> -OnPremisesExtensionAttributes @{ extensionAttribute1 = $null }` (cloud-only users; synced users in on-premises AD). The Entra portal does not show this attribute. The dynamic group empties and the Exchange scope matches nobody.
 - Full teardown: remove the Exchange role assignment and scope, delete the Automation account, delete the two groups.
 
 ## Troubleshooting
 
-**Phone has no primary user.** Runbook 1 logs `Device '<name>' serial <serial> has no primary user and is ignored` and counts it in `DevicesWithoutPrimaryUser`. Set the primary user in Intune (Devices > the device > Properties > Primary user). The user is stamped on the next run.
+**Phone has no primary user.** Runbook 1 logs `Device '<name>' serial <serial> has no primary user and is ignored` and counts it in `DevicesWithoutPrimaryUser`. The line is a warning, so it is on the job's **Warnings** tab, not Output. Retire the phone and enroll it again with its user signing in (Intune cannot set an iOS primary user in place). The user is stamped on the next run.
 
 **Device reports no phone number.** Skip reason `NoPhoneNumber`. Intune collects hardware inventory about every 7 days, so a fresh enrollment may show its primary user before its number; the stamp lands first and the number follows. Some carriers and eSIM profiles never report a number. The user stays in the directory without a mobile number. Set `mobilePhone` by hand if you need it sooner.
 
@@ -165,7 +166,9 @@ Change the device's primary user in Intune. Runbook 1 moves the stamp on its nex
 
 **Duplicate contacts.** Two kinds. Duplicates among runbook-owned contacts (same `DirectorySourceId`) are deleted automatically on the next run; the log shows `DELETE ... (duplicate)`. Duplicates between a runbook contact and a personal contact the user created themselves are expected and untouched; the user can delete their own copy. If the native app shows a coworker twice with the same data, check that Outlook is not also syncing contacts from a second account.
 
-**Module import failures in Automation.** The runtime environment must be PowerShell 7.4 (7.2 is .NET 6 and current Graph SDK modules fail to load there) and every `Microsoft.Graph.*` package must show provisioning state Succeeded at the same version. 2.40.0 is known good; 2.41.0 and 2.41.1 fail. Never update the pinned version in place: create a second runtime environment with the candidate version, point a test copy of the runbook at it, and switch only when it runs clean. Import order matters: `Microsoft.Graph.Authentication` first.
+**PowerShell 7.4 end of support (10 November 2026).** The runbooks run in an Azure Automation PowerShell 7.4 runtime environment. When Azure Automation offers a newer runtime (7.6), create a second runtime environment on it with the same pinned modules, run both runbooks there with `WhatIf = true`, then point the runbooks at it with `Deploy-Automation.ps1 -RuntimeEnvironmentName <new name>`. Nothing in the runbooks is specific to 7.4. The admin workstation (Sandbox script) already installs 7.6 LTS.
+
+**Module import failures in Automation.** The runtime environment must be PowerShell 7.4 or later (7.2 is .NET 6 and current Graph SDK modules fail to load there) and every `Microsoft.Graph.*` package must show provisioning state Succeeded at the same version. 2.40.0 is known good; 2.41.0 and 2.41.1 fail. Never update the pinned version in place: create a second runtime environment with the candidate version, point a test copy of the runbook at it, and switch only when it runs clean. Import order matters: `Microsoft.Graph.Authentication` first.
 
 **429 throttling.** Both runbooks honor `Retry-After` with exponential backoff, and Runbook 2 retries only the throttled sub-requests of a batch. Retries appear in the job's warning stream. A job that ends with `still throttled after 6 rounds` on some requests reports them as errors and shows Failed; re-run it, the reconcile is idempotent. Sustained throttling at this scale (about 320 requests on a first run) is unusual and usually means another workload is hammering the same mailboxes.
 

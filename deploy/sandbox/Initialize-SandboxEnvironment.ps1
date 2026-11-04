@@ -6,7 +6,7 @@
 .DESCRIPTION
     Windows Sandbox starts clean every time: PowerShell 5.1 only, no Git, no modules, no cached account.
     This script, in order:
-      1. Installs PowerShell 7.4 (the deploy scripts and runbooks target 7.4) from the official MSI.
+      1. Installs PowerShell 7.6 LTS from the official MSI (the deploy scripts need 7.4 or later).
       2. Installs Git for Windows (silent) and clones the repo, or downloads a zip if you set a token.
       3. Inside PowerShell 7, installs the exact modules the repo needs into the PowerShell 7 module path:
             Az.Accounts, Az.Resources, Az.Automation, Az.Monitor
@@ -37,7 +37,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $RepoUrl            = 'https://github.com/pavelkondratyukrepo/Iphonecontact-sync'
-$RepoBranch         = 'claude/pensive-lamport-u50q36'   # change when the branch is merged or renamed
+$RepoBranch         = ''                                # empty = the repo's default branch; set a name to test another branch
 $WorkDir            = Join-Path $env:USERPROFILE 'Desktop\CorpiPhone'
 $RepoDir            = Join-Path $WorkDir 'Iphonecontact-sync'
 $GraphModuleVersion = '2.40.0'                          # must match -GraphModuleVersion in Deploy-Automation.ps1
@@ -49,8 +49,10 @@ $OpenWindow         = $true                             # open a PowerShell 7 wi
 # when the browser flow is inconvenient). The token is used once, for one download, and never written to disk.
 $GitHubToken        = ''
 
-# Fallback versions if the GitHub API cannot be reached to resolve the newest 7.4.x / Git release.
-$PwshFallbackVersion = '7.4.6'
+# Fallback versions if the GitHub API cannot be reached to resolve the newest 7.6.x / Git release.
+# PowerShell 7.6 is the current LTS; 7.4 reaches end of support on 10 November 2026. The deploy scripts and the tests
+# run on any 7.4 or later, so the workstation uses the supported LTS even while Azure Automation still runs 7.4.
+$PwshFallbackVersion = '7.6.6'
 $GitFallbackTag      = 'v2.47.1.windows.1'
 
 $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
@@ -78,7 +80,7 @@ function Get-LatestReleaseAsset {
         [string]$AssetPattern
     )
     try {
-        $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=30" -Headers @{ 'User-Agent' = 'corpiphone-sandbox-setup' } -TimeoutSec 30
+        $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" -Headers @{ 'User-Agent' = 'corpiphone-sandbox-setup' } -TimeoutSec 30
         foreach ($rel in $releases) {
             if ($rel.prerelease -or $rel.draft) { continue }
             if ($rel.tag_name -notmatch $TagPattern) { continue }
@@ -100,7 +102,7 @@ function Save-Download {
     $previous = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is many times faster without the progress bar
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -Headers @{ 'User-Agent' = 'corpiphone-sandbox-setup' }
+        Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -TimeoutSec 600 -Headers @{ 'User-Agent' = 'corpiphone-sandbox-setup' }
     }
     finally {
         $ProgressPreference = $previous
@@ -114,7 +116,7 @@ function Install-PowerShell7 {
         Write-Host "    PowerShell $existing already installed"
         return
     }
-    $asset = Get-LatestReleaseAsset -Repo 'PowerShell/PowerShell' -TagPattern '^v7\.4\.\d+$' -AssetPattern '^PowerShell-7\.4\.\d+-win-x64\.msi$'
+    $asset = Get-LatestReleaseAsset -Repo 'PowerShell/PowerShell' -TagPattern '^v7\.6\.\d+$' -AssetPattern '^PowerShell-7\.6\.\d+-win-x64\.msi$'
     if (-not $asset) {
         $asset = [PSCustomObject]@{
             Tag  = "v$PwshFallbackVersion"
@@ -169,11 +171,12 @@ function Get-RepoCheckout {
         # Zip download with a token: no Git needed, works for private repos, nothing is written to disk but the zip.
         $owner, $name = ($RepoUrl -replace '^https://github\.com/', '' -replace '\.git$', '').Split('/')
         $zip = Join-Path $downloadDir "$name.zip"
-        Write-Host "    downloading $owner/$name@$RepoBranch as zip"
+        $ref = if ($RepoBranch) { "/$RepoBranch" } else { '' }   # no ref = default branch
+        Write-Host "    downloading $owner/$name$(if ($RepoBranch) { "@$RepoBranch" } else { ' (default branch)' }) as zip"
         $previous = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
         try {
-            Invoke-WebRequest -Uri "https://api.github.com/repos/$owner/$name/zipball/$RepoBranch" -OutFile $zip -UseBasicParsing `
+            Invoke-WebRequest -Uri "https://api.github.com/repos/$owner/$name/zipball$ref" -OutFile $zip -UseBasicParsing -TimeoutSec 600 `
                 -Headers @{ Authorization = "Bearer $GitHubToken"; 'User-Agent' = 'corpiphone-sandbox-setup'; Accept = 'application/vnd.github+json' }
         }
         finally { $ProgressPreference = $previous }
@@ -185,9 +188,15 @@ function Get-RepoCheckout {
     }
     else {
         Install-GitForWindows
-        Write-Host "    cloning $RepoUrl ($RepoBranch). If the repo is private, Git Credential Manager opens a browser sign-in."
-        & $gitExe clone --branch $RepoBranch --single-branch $RepoUrl $RepoDir
-        if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE. Check the branch name and your access to the repo." }
+        if ($RepoBranch) {
+            Write-Host "    cloning $RepoUrl (branch $RepoBranch). If the repo is private, Git Credential Manager opens a browser sign-in."
+            & $gitExe clone --branch $RepoBranch --single-branch $RepoUrl $RepoDir
+        }
+        else {
+            Write-Host "    cloning $RepoUrl (default branch). If the repo is private, Git Credential Manager opens a browser sign-in."
+            & $gitExe clone $RepoUrl $RepoDir
+        }
+        if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE. Check your access to the repo$(if ($RepoBranch) { " and that branch '$RepoBranch' exists, or set `$RepoBranch = '' for the default branch" })." }
     }
     # Files that came from the internet are marked and PowerShell 7's RemoteSigned policy would refuse the deploy scripts.
     Get-ChildItem -Path $RepoDir -Recurse -File | Unblock-File
@@ -323,7 +332,7 @@ try {
     Write-Host "CorpiPhone sandbox setup starting $(Get-Date -Format 'u')" -ForegroundColor Cyan
     Write-Host "Windows PowerShell $($PSVersionTable.PSVersion) on $([Environment]::OSVersion.VersionString)"
 
-    Write-Step '1/4 PowerShell 7.4'
+    Write-Step '1/4 PowerShell 7.6 LTS'
     Install-PowerShell7
 
     Write-Step '2/4 Repository'

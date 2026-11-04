@@ -130,6 +130,15 @@ Describe 'Windows Sandbox bootstrap script' {
         }
     }
 
+    It 'clones the default branch unless told otherwise (no working-branch name baked in)' {
+        $text | Should -Match "(?m)^\`$RepoBranch\s*=\s*''"
+    }
+
+    It 'installs a supported PowerShell LTS (7.6), not 7.4 which ends support on 10 November 2026' {
+        $text | Should -Match ([regex]::Escape("-TagPattern '^v7\.6\.\d+`$'"))
+        $text | Should -Match "\`$PwshFallbackVersion = '7\.6\.\d+'"
+    }
+
     It 'pins the same Graph module version the deploy script defaults to' {
         $deploy = Get-Content -Path (Join-Path $root 'deploy' 'Deploy-Automation.ps1') -Raw
         $deploy -match "\[string\]\`$GraphModuleVersion = '([0-9.]+)'" | Should -BeTrue

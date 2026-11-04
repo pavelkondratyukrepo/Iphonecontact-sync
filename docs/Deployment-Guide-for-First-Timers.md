@@ -40,7 +40,7 @@ You do not need to memorize these. Come back here when a word stops you.
 | Dynamic group | A security group that fills itself from a rule, here "everyone tagged as a company iPhone user". |
 | extensionAttribute1 | A spare text field on every user in Entra. The morning runbook writes the word CorpiPhone there as the tag. The group rule and the mailbox permission both look at it. |
 | Graph | Microsoft's programming interface to all of the above. The scripts talk to it. You will see the word in permission names. |
-| PowerShell | The command-line tool the scripts are written in. Windows has an old version (5.1) built in. The scripts need the newer version 7.4, which the setup script installs for you. |
+| PowerShell | The command-line tool the scripts are written in. Windows has an old version (5.1) built in. The scripts need the newer version 7 (7.4 or later), which the setup script installs for you. |
 | Windows Sandbox | A throwaway copy of Windows that starts clean and is wiped when you close it. Safe place to run setup scripts without changing your real PC. |
 | UPN | User principal name. A person's sign-in address, usually the same as their email, like jane.doe@contoso.com. |
 | App Protection Policy (APP) | An Intune rule for what an app may do with company data. Here it allows Outlook to write contacts to the phone. |
@@ -80,9 +80,15 @@ Open a notepad and collect these. You will paste them into commands later.
 
 ### 3. Two quick checks in your tenant
 
-**Check A: nobody already uses extensionAttribute1.** The scripts use this spare field as the tag and will refuse to run if it already holds other values. In entra.microsoft.com, go to **Users**, open a few users, click **Properties**, and scroll to **Extension attributes**. Field 1 should be empty for everyone. If your company uses it for something else (cost centers, for example), stop and read the "If something goes wrong" section about choosing another attribute before continuing.
+**Check A: nobody already uses extensionAttribute1.** The scripts use this spare field as the tag and will refuse to run if it already holds other values. The Entra portal does not show this field, so check it with one command. Do this right after Step 0 (the Sandbox setup), before Step 1. Paste this into the PowerShell 7 window as one line and sign in with the code it shows:
 
-**Check B: every company iPhone has a primary user.** In intune.microsoft.com, go to **Devices**, then **All devices**. Click **Filter**, choose OS = iOS/iPadOS and Ownership = Corporate. Look at the **Primary user** column. Any blank is a phone the scripts will ignore. To fix one, open the device, click **Properties**, then **Change primary user**, and pick the person who carries that phone. Do this for every blank before Step 3.
+```powershell
+Connect-MgGraph -Scopes User.Read.All -UseDeviceCode -NoWelcome; Get-MgUser -All -Property UserPrincipalName,OnPremisesExtensionAttributes | Where-Object { $_.OnPremisesExtensionAttributes.ExtensionAttribute1 } | Select-Object UserPrincipalName, @{ n = 'Attribute1'; e = { $_.OnPremisesExtensionAttributes.ExtensionAttribute1 } }
+```
+
+No output means nobody uses it, which is what you want. If names appear, your company uses the field for something else (cost centers, for example): stop and read the "If something goes wrong" section about choosing another attribute before continuing. (You can also see the same value per person in the Exchange admin center: **Recipients**, **Mailboxes**, the person, **Others**, **Custom attributes**, attribute 1.)
+
+**Check B: every company iPhone has a primary user.** In intune.microsoft.com, go to **Devices**, then **All devices**. Click **Filter**, choose OS = iOS/iPadOS and Ownership = Corporate. Look at the **Primary user** column. Any blank is a phone the scripts will ignore. Intune can only change the primary user of Windows PCs. For an iPhone the primary user is whoever enrolled it, so a phone with the wrong or no primary user must be retired (or wiped) and enrolled again with the right person signing in. For Automated Device Enrollment phones, use an enrollment profile **with user affinity**. Do this for every blank (and every phone showing the wrong person) before Step 3.
 
 ### 4. A Windows PC with Windows Sandbox
 
@@ -152,7 +158,7 @@ The clipboard is shared between your PC and the Sandbox, so the paste works. If 
 
 | Line on screen | What is happening | Typical wait |
 | --- | --- | --- |
-| `==> 1/4 PowerShell 7.4` | Downloading and installing PowerShell 7 | 1 to 2 minutes |
+| `==> 1/4 PowerShell 7.6 LTS` | Downloading and installing PowerShell 7 | 1 to 2 minutes |
 | `==> 2/4 Repository` | Installing Git, then downloading the project. A browser window may open inside the Sandbox asking you to sign in to GitHub. Sign in with your GitHub account and click Authorize. | 1 to 3 minutes |
 | `==> 3/4 Modules` | Downloading about a dozen PowerShell modules. Lines like `install Az.Accounts` appear one by one. This is the slow part. | 5 to 10 minutes |
 | `==> 4/4 Pester tests` | Running the project's self-tests. You want to see `Tests Passed: 117, Failed: 0` (the first number may be higher in a newer version; Failed must be 0). | 30 seconds |
@@ -300,7 +306,7 @@ The output is a list of time-stamped lines. Read them like this:
 | Line contains | Meaning |
 | --- | --- |
 | `Read 42 corporate iOS devices, 40 with a primary user` | How many company iPhones Intune reported, and how many have a person assigned |
-| `WARN ... has no primary user` | A phone nobody is assigned to. It is ignored. Fix it in Intune (see Before you start, Check B) |
+| `WARN ... has no primary user` | A phone nobody is assigned to. It is ignored. These lines are on the job's **Warnings** tab, not the Output tab, so open that tab too. Fix them in Intune (see Before you start, Check B) |
 | `WHATIF STAMP jane.doe@contoso.com` | This person **would** get the tag |
 | `WHATIF PHONE jane.doe@contoso.com mobilePhone (none) -> +18045550123` | Her number **would** be written to her profile |
 | `SKIP NoPhoneNumber : ...` | The phone has not reported its number to Intune yet. Normal for new phones; it arrives within a week |
@@ -432,15 +438,17 @@ From now on, each pilot user's phone picks up the directory the next time Outloo
 
 ### 5.6 Two tests that prove the upkeep works
 
-**Leaver test.** Pretend one pilot user left. In intune.microsoft.com, open their iPhone, **Properties**, **Change primary user**, and set it to a test account or remove it. Run **Sync-IntuneToEntra** live (Step 3.4): the output shows `APPLY UNSTAMP` for them and they drop out of `SG-CorpiPhone-Users` within minutes. Then run **Sync-DirectoryToMailboxes** live with no user name: the output shows `APPLY DELETE` for their card in every other mailbox, and their contact disappears from the other pilot phones. Finally put the primary user back and run both runbooks live again; they are restored.
+**Leaver test.** Use a spare test iPhone enrolled to a test account that is in the pilot (not a real person's phone). In intune.microsoft.com, open that iPhone and click **Retire**. Run **Sync-IntuneToEntra** live (Step 3.4): the output shows `APPLY UNSTAMP` for the test account and it drops out of `SG-CorpiPhone-Users` within minutes. Then run **Sync-DirectoryToMailboxes** live with no user name: the output shows `APPLY DELETE` for its card in every other mailbox, and the contact disappears from the other pilot phones. Finally enroll the test phone again with the test account and run both runbooks live again; it is restored. Note: the leaver's own mailbox keeps the cards it already had, because once untagged the automation is no longer allowed into that mailbox. Their phone loses them when Outlook is retired from it.
 
-**Edit test.** On a pilot phone, open one Company Directory contact in the Contacts app and change the job title to something silly. Run **Sync-DirectoryToMailboxes** live. The output shows exactly one `APPLY UPDATE` for that card, and the phone shows the real title again within minutes. Nothing else changed.
+**Edit test.** On a pilot phone, open one Company Directory contact in the Contacts app and change the job title to something silly. Wait a few minutes for Outlook to sync the edit back to the mailbox. Run **Sync-DirectoryToMailboxes** live. The output shows exactly one `APPLY UPDATE` for that card ending in `(edited in mailbox)`, the summary shows `LocalEditsReverted=1`, and the phone shows the real title again within minutes. Nothing else changed.
+
+**No-churn check.** Run **Sync-DirectoryToMailboxes** live once more right away. The summary must show `Updated=0`. If instead many cards show `(edited in mailbox)` that nobody touched, Exchange is reformatting a field: run it with **DETECTLOCALEDITS** = `False` from then on (also edit the Monday schedule's parameters) and tell the repo maintainer which field differs.
 
 ### 5.7 Check it worked
 
 - [ ] A pilot phone shows coworkers in the Contacts app and resolves caller ID.
 - [ ] The full run ended `Errors=0`.
-- [ ] Leaver test and edit test behaved as described.
+- [ ] Leaver test, edit test and no-churn check behaved as described.
 
 ## Step 6: Turn on the schedules and check the alert
 
@@ -450,13 +458,14 @@ Step 1 already created both schedules but left them switched off so nothing coul
 
 ### 6.1 Enable the two schedules
 
-1. portal.azure.com, open your automation account. In the left menu under **Shared Resources**, click **Schedules**.
-2. You see two: `Sync-IntuneToEntra-Daily-0500` and `Sync-DirectoryToMailboxes-Weekly-Mon-0800`. Both show **Enabled: No**.
-3. Click the first one. In the panel, switch **Enabled** to **Yes** and click **Save**. Repeat for the second.
+1. In the Sandbox PowerShell 7 window, run the Step 1 command again with `-EnableSchedules` added at the end. It changes nothing else. If a schedule's original start time has already passed (it will have, after a pilot), the script recreates that schedule with the next correct start time before switching it on.
+2. Check: portal.azure.com, your automation account, **Shared Resources**, **Schedules**. Both `Sync-IntuneToEntra-Daily-0500` and `Sync-DirectoryToMailboxes-Weekly-Mon-0800` show **Enabled: Yes** and a **Next run** time in the future.
 
 The times are 05:00 every day and 08:00 every Monday, in the time zone chosen at deployment (America/New\_York unless you changed it). The three-hour gap on Monday is deliberate: it gives Exchange time to recognize anyone tagged that morning.
 
-If you prefer PowerShell, running the Step 1 command again with `-EnableSchedules` added at the end does the same thing and changes nothing else.
+Portal alternative: open each schedule, switch **Enabled** to **Yes**, **Save**. If the portal complains the start time is in the past, set it to the next 05:00 (daily schedule) or the next Monday 08:00 (weekly schedule) in America/New\_York, then save.
+
+Re-running the Step 1 command later without `-EnableSchedules` is safe: it leaves the schedules exactly as they are.
 
 ### 6.2 Check the schedules are linked with the right settings
 
@@ -527,12 +536,12 @@ Once it is running, almost nothing needs you. These are the only things that eve
 | --- | --- | --- |
 | **A new company iPhone** | Enroll it in Intune with the user set as **primary user**. That is all. | Next morning at 05:00 the user is tagged. Within minutes they join the group and the Outlook policies reach the phone. Monday at 08:00 their mailbox gets the directory and they appear in everyone else's. |
 | **New phone, but the user cannot wait for Monday** | After the next morning run, start **Sync-DirectoryToMailboxes** in the portal with **WHATIF** = `False` and **USERPRINCIPALNAME** = their address. Wait at least 30 minutes after the morning run before doing this. | Their mailbox fills in under a minute. |
-| **A phone is handed to someone else** | In intune.microsoft.com, open the device, **Properties**, **Change primary user**. | The old holder is untagged and the new one tagged next morning. Monday swaps the contact cards everywhere. |
+| **A phone is handed to someone else** | Retire (or wipe) the phone in intune.microsoft.com, then enroll it again with the new person signing in. Intune cannot change an iPhone's primary user in place. | The old holder is untagged and the new one tagged next morning. Monday swaps the contact cards everywhere. The old holder's mailbox keeps the cards it had; they can delete the **Company Directory** category in Outlook if they want them gone. |
 | **Someone leaves** | Retire or wipe the phone in Intune, or disable the account as you normally do. | Untagged next morning, removed from everyone's contacts on Monday. |
 | **Someone should receive the directory but not be in it** (an executive, security staff) | In entra.microsoft.com, add them to **SG-Directory-Exclude**. | From Monday their card is removed from other phones. They keep receiving everyone else's cards, and their phone number stops being written to their profile. |
 | **A person's title, department or number changed in the directory** | Nothing. | Monday's run updates their card in every mailbox. |
 | **You get the failure email** | Open the automation account, **Jobs**, click the failed job, read the **Errors** tab, then the **Output** tab's last lines. Match the message against "If something goes wrong". Fix the cause and start the runbook again; running twice is always safe. |  |
-| **You want to see what ran last night** | Automation account, **Jobs**, click the job, **Output**. One line per change, a summary at the end. The **Warnings** tab holds retry notices, which are harmless. |  |
+| **You want to see what ran last night** | Automation account, **Jobs**, click the job, **Output**. One line per change, a summary at the end. Then open the **Warnings** tab: it holds retry notices (harmless) and the `has no primary user` warnings (phones to fix in Intune). Read it after every morning run during the first weeks. |  |
 
 **Two things never to do.** Do not add or remove members of `SG-CorpiPhone-Users` by hand; the rule refills it and your change is undone within minutes. Do not update the Microsoft.Graph modules inside the automation account's runtime environment; a newer version may not load and both runbooks would fail. If a newer version is ever needed, create a second runtime environment to test it first (the README explains how).
 
@@ -549,8 +558,8 @@ Find the message or symptom you are seeing in the left column. Everything here h
 | Any script: `insufficient privileges` or `Authorization_RequestDenied` | Your admin account lacks a role, or a PIM role was not activated | Check roles (Before you start, 1). Activate PIM roles. Run again. |
 | Step 1: red `The identity holds Graph permission 'Contacts.ReadWrite'` | Someone granted an unscoped Contacts permission in Entra. It would let the account read **every** mailbox | In entra.microsoft.com, **Enterprise applications**, filter **Managed Identities**, open the account, **Permissions**, remove the Contacts entry (or run the exact `Remove-...` command the script printed). Re-run Step 2 with `-TestOnly`. |
 | Step 1: a module line ends `Failed` instead of `imported` | Azure could not import that Graph module version | Run the Step 1 command again; transient failures clear. If it fails twice on the same module, the pinned version has a problem; ask the repo maintainer before changing `-GraphModuleVersion`. |
-| Step 3: red `user(s) carry a foreign value in extensionAttribute1` | Your company already uses that spare field for something else. The runbook refused to overwrite it and changed nothing | Either clear the field on the users listed (Entra, user, Properties, Extension attributes), or ask the repo maintainer to switch the project to a different attribute. This must be decided before continuing. |
-| Step 3: a person with an iPhone is missing from the STAMP list | Their phone has no primary user in Intune, or is not marked Corporate | Intune, **Devices**, open the phone, **Properties**, set **Primary user**. Check **Ownership** says Corporate. Run the preview again. |
+| Step 3: red `user(s) carry a foreign value in extensionAttribute1` | Your company already uses that spare field for something else. The runbook refused to overwrite it and changed nothing | Either clear the field on the users listed, or ask the repo maintainer to switch the project to a different attribute. This must be decided before continuing. To clear it for a cloud-only user: `Update-MgUser -UserId <upn> -OnPremisesExtensionAttributes @{ extensionAttribute1 = $null }` (after `Connect-MgGraph -Scopes User.ReadWrite.All -UseDeviceCode`). For users synced from on-premises Active Directory, clear it in AD instead. |
+| Step 3: a person with an iPhone is missing from the STAMP list | Their phone has no primary user in Intune, or is not marked Corporate | Intune, **Devices**, open the phone. If **Ownership** is not Corporate, change it under **Properties**. If the primary user is blank or wrong, retire the phone and enroll it again with that person signing in (Intune cannot change an iPhone's primary user in place). Run the preview again. |
 | Step 3: `SKIP NoPhoneNumber` for someone | The phone has not reported its number yet, or the carrier/eSIM never does | Wait up to a week for Intune's inventory. If it never appears, type the number into the user's **Mobile phone** field in Entra by hand. Everything else still works. |
 | Step 3: `SKIP PrivilegedRole` | The person is an admin. The runbook never writes admins' numbers, on purpose | If you want their number in the directory, type it into their profile in Entra by hand. |
 | Step 3.5: the dynamic group stays empty | The rule is wrong, or dynamic groups are not licensed | Entra, the group, **Dynamic membership rules**: rule must be exactly `(user.extensionAttribute1 -eq "CorpiPhone")`. Dynamic groups need an Entra ID P1 license (included in E3/E5). |
@@ -585,11 +594,11 @@ In intune.microsoft.com, **Apps**, **App configuration policies**, open `ACP - O
 
 ### Level 4: Remove the tag
 
-Start **Sync-IntuneToEntra** live after retiring the phones, or clear **Extension attribute 1** on the users in Entra by hand. The dynamic group empties and the Exchange permission matches nobody.
+Start **Sync-IntuneToEntra** live after retiring the phones, or clear the attribute by hand for every tagged user with one line in the PowerShell 7 window: `Connect-MgGraph -Scopes User.ReadWrite.All -UseDeviceCode -NoWelcome; Get-MgUser -All -Property Id,OnPremisesExtensionAttributes | Where-Object { $_.OnPremisesExtensionAttributes.ExtensionAttribute1 -eq 'CorpiPhone' } | ForEach-Object { Update-MgUser -UserId $_.Id -OnPremisesExtensionAttributes @{ extensionAttribute1 = $null } }`. The dynamic group empties and the Exchange permission matches nobody. Do Level 3 first: once the tag is gone the automation can no longer reach the mailboxes to remove the cards.
 
 ### Level 5: Delete it all
 
-1. In the Sandbox PowerShell window, connect to Exchange and remove the permission: `Connect-ExchangeOnline -Device` then `Remove-ManagementRoleAssignment -Identity (Get-ManagementRoleAssignment -Role 'Application Contacts.ReadWrite' | Where-Object CustomRecipientWriteScope -eq 'CorpiPhoneMailboxes').Name` then `Remove-ManagementScope -Identity CorpiPhoneMailboxes` then `Remove-ServicePrincipal -Identity <object id>`.
+1. In the Sandbox PowerShell window, connect to Exchange and remove the permission: `Connect-ExchangeOnline -Device` then `Remove-ManagementRoleAssignment -Identity CorpiPhone-ContactsReadWrite-CorpiPhoneMailboxes` (if that name is not found, list the assignments with `Get-ManagementRoleAssignment -Role 'Application Contacts.ReadWrite' | Format-List Name,RoleAssignee*,CustomResourceScope` and remove the one for this identity) then `Remove-ManagementScope -Identity CorpiPhoneMailboxes` then `Remove-ServicePrincipal -Identity <object id>`.
 2. portal.azure.com, open the resource group `rg-corpiphone-sync`, click **Delete resource group**, type its name to confirm. This removes the automation account, its identity, schedules and the alert in one go.
 3. entra.microsoft.com, **Groups**, delete `SG-CorpiPhone-Users` and `SG-Directory-Exclude`.
 4. intune.microsoft.com, delete the two policies under **Apps**, or just remove their assignments if you want to keep them.
@@ -610,7 +619,7 @@ Every command in one place. Fill in the angle brackets, paste each as one line i
 | 4 | Entra | Groups, New group, `SG-CorpiPhone-Pilot`, add 5 to 10 users |
 | 4 | PowerShell 7 | `./deploy/New-OutlookContactSyncPolicies.ps1 -UseDeviceCode -GroupName SG-CorpiPhone-Pilot` |
 | 5 | Azure portal | **Sync-DirectoryToMailboxes**, Start: WHATIF = True + USERPRINCIPALNAME = pilot user; then WHATIF = False + same user; then WHATIF = False, no user |
-| 6 | Azure portal | Automation account, Schedules, both to Enabled = Yes. Or PowerShell: step 1 command with `-EnableSchedules` added |
+| 6 | PowerShell 7 | Step 1 command with `-EnableSchedules` added. Then check both schedules show Enabled = Yes and a future Next run |
 | 7 | PowerShell 7 | `./deploy/New-OutlookContactSyncPolicies.ps1 -UseDeviceCode -GroupName SG-CorpiPhone-Users` |
 | Onboarding one user early | Azure portal | **Sync-DirectoryToMailboxes**, Start: WHATIF = False, USERPRINCIPALNAME = the user |
 

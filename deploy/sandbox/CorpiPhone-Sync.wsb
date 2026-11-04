@@ -3,8 +3,9 @@
 
   1. On the host, create a folder (for example C:\CorpiPhone-Sandbox) and copy Initialize-SandboxEnvironment.ps1 into it.
   2. Edit HostFolder below to that path.
-  3. Double-click this .wsb file. The Sandbox opens and runs the setup script automatically in Windows PowerShell 5.1;
-     it installs PowerShell 7.4, Git, the modules, clones the repo and runs the tests, then opens a PowerShell 7 window.
+  3. Double-click this .wsb file. The Sandbox opens and, after the desktop appears, a visible "CorpiPhone setup" window
+     runs the setup script in Windows PowerShell 5.1 (LogonCommand itself runs hidden, so it starts that window);
+     it installs PowerShell 7.6, Git, the modules, clones the repo and runs the tests, then opens a PowerShell 7 window.
 
   The mapped folder is read-only inside the Sandbox, so nothing you do there can touch the host.
   Everything inside the Sandbox is discarded when you close it.
@@ -18,7 +19,7 @@
     </MappedFolder>
   </MappedFolders>
   <LogonCommand>
-    <Command>powershell.exe -ExecutionPolicy Bypass -NoExit -File C:\Users\WDAGUtilityAccount\Desktop\Setup\Initialize-SandboxEnvironment.ps1</Command>
+    <Command>cmd.exe /c start "CorpiPhone setup" powershell.exe -ExecutionPolicy Bypass -NoExit -File C:\Users\WDAGUtilityAccount\Desktop\Setup\Initialize-SandboxEnvironment.ps1</Command>
   </LogonCommand>
   <Networking>Default</Networking>
   <MemoryInMB>8192</MemoryInMB>

@@ -361,6 +361,13 @@ Describe 'Sync-DirectoryToMailboxes main flow' {
             { & $script:Runbook -WhatIf $false -GroupName 'SG-Nope' -ExclusionGroupName 'SG-Directory-Exclude' } | Should -Throw "*Control group 'SG-Nope' was not found*"
         }
 
+        It 'refuses to guess when two groups share the control group''s name' {
+            $null = New-Scenario
+            $global:FakeTenant.DuplicateGroupNames = @('SG-CorpiPhone-Users')
+            { & $script:Runbook -WhatIf $false -GroupName 'SG-CorpiPhone-Users' -ExclusionGroupName 'SG-Directory-Exclude' } | Should -Throw '*More than one group is named*'
+            $global:FakeTenant.BatchCalls | Should -Be 0
+        }
+
         It 'fails before writing when the exclusion group does not exist' {
             $null = New-Scenario
             { & $script:Runbook -WhatIf $false -GroupName 'SG-CorpiPhone-Users' -ExclusionGroupName 'SG-Nope' } | Should -Throw '*Exclusion group*not found*'

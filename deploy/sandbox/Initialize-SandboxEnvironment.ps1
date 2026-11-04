@@ -13,7 +13,8 @@
             Microsoft.Graph.Authentication / Users / Groups / Applications / DeviceManagement / PersonalContacts
                pinned to the same version the Automation runtime environment uses (2.40.0)
             ExchangeOnlineManagement 3.x, Pester 5+, PSScriptAnalyzer
-         and turns off WAM (broker) sign-in for Az and Graph, which cannot work in Sandbox.
+         and turns off WAM (broker) sign-in for Az. Graph cannot turn it off for its default app, so the deploy
+         scripts' -UseDeviceCode switch is what avoids the broker for Graph in Sandbox.
       4. Runs the repo's Pester tests so you know the checkout is good before touching the tenant.
       5. Opens a PowerShell 7 window in the repo folder with the next commands printed.
 
@@ -44,16 +45,17 @@ $GraphModuleVersion = '2.40.0'                          # must match -GraphModul
 $RunTests           = $true                             # run Invoke-Pester ./tests after setup
 $OpenWindow         = $true                             # open a PowerShell 7 window in the repo when done
 
-# Repo access. Leave $GitHubToken empty to clone with Git (Git Credential Manager opens a browser sign-in).
-# Set a fine-grained PAT with read access to the repo to download a zip without Git (useful for a private repo
-# when the browser flow is inconvenient). The token is used once, for one download, and never written to disk.
-$GitHubToken        = ''
+# Repo access. By default the repo is cloned with Git (Git Credential Manager opens a browser sign-in if it is private).
+# To download a zip without Git instead, first run   $env:CORPIPHONE_GITHUB_TOKEN = '<fine-grained read-only PAT>'
+# in the same window, then paste this script. Keeping the token out of this file means it never lands in the .wsb host
+# folder or a saved copy of the script. Treat the Sandbox as a convenience, not a privileged access workstation.
+$GitHubToken        = $env:CORPIPHONE_GITHUB_TOKEN   # set this environment variable before pasting; never type a token into this file
 
 # Fallback versions if the GitHub API cannot be reached to resolve the newest 7.6.x / Git release.
 # PowerShell 7.6 is the current LTS; 7.4 reaches end of support on 10 November 2026. The deploy scripts and the tests
 # run on any 7.4 or later, so the workstation uses the supported LTS even while Azure Automation still runs 7.4.
 $PwshFallbackVersion = '7.6.6'
-$GitFallbackTag      = 'v2.47.1.windows.1'
+$GitFallbackTag      = 'v2.56.0.windows.1'
 
 $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
 $downloadDir = Join-Path $env:TEMP "corpiphone-setup-$timestamp"
@@ -142,9 +144,11 @@ function Install-GitForWindows {
         Write-Host "    Git already installed: $(& $gitExe --version)"
         return
     }
-    $asset = Get-LatestReleaseAsset -Repo 'git-for-windows/git' -TagPattern '^v2\.\d+\.\d+\.windows\.\d+$' -AssetPattern '^Git-2\.\d+\.\d+-64-bit\.exe$'
+    $asset = Get-LatestReleaseAsset -Repo 'git-for-windows/git' -TagPattern '^v2\.\d+\.\d+\.windows\.\d+$' -AssetPattern '^Git-2\.\d+\.\d+(\.\d+)?-64-bit\.exe$'
     if (-not $asset) {
-        $ver = ($GitFallbackTag -replace '^v', '') -replace '\.windows\.\d+$', ''
+        # Tag v2.X.Y.windows.1 ships Git-2.X.Y-64-bit.exe; rebuild .windows.N (N > 1) ships Git-2.X.Y.N-64-bit.exe.
+        $null = $GitFallbackTag -match '^v(\d+\.\d+\.\d+)\.windows\.(\d+)$'
+        $ver = if ([int]$Matches[2] -gt 1) { "$($Matches[1]).$($Matches[2])" } else { $Matches[1] }
         $asset = [PSCustomObject]@{
             Tag  = $GitFallbackTag
             Name = "Git-$ver-64-bit.exe"
@@ -258,8 +262,9 @@ Import-Module Az.Accounts
 try { Update-AzConfig -EnableLoginByWam $false -Scope CurrentUser | Out-Null; Write-Host '    Az: WAM sign-in disabled' }
 catch { Write-Host "    Az: could not disable WAM ($($_.Exception.Message)); use -UseDeviceCode on the deploy scripts" -ForegroundColor Yellow }
 Import-Module Microsoft.Graph.Authentication
-try { Set-MgGraphOption -EnableLoginByWAM $false; Write-Host '    Graph: WAM sign-in disabled' }
-catch { Write-Host "    Graph: could not disable WAM ($($_.Exception.Message)); use -UseDeviceCode on the deploy scripts" -ForegroundColor Yellow }
+# Microsoft Graph PowerShell 2.34+ cannot disable WAM for its default app id; -UseDeviceCode on every deploy script
+# is the supported way around the broker here, so nothing is changed for Graph.
+Write-Host '    Graph: sign in with -UseDeviceCode on the deploy scripts (the broker cannot be turned off for Graph)'
 
 Write-Host ''
 Write-Host '    Installed module versions:'

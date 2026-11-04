@@ -111,7 +111,7 @@ Describe 'Windows Sandbox bootstrap script' {
         $findings.Count | Should -Be 0 -Because (($findings | ForEach-Object { "[$($_.Severity)] $($_.RuleName) line $($_.Line): $($_.Message)" }) -join "`n")
     }
 
-    It 'is paste-safe: no #Requires, no Break or Return at script scope, no PowerShell 7 operators' {
+    It 'is paste-safe: no #Requires, no Break, Return or Exit at script scope, no PowerShell 7 operators' {
         $text | Should -Not -Match '(?m)^#Requires'
         $text | Should -Not -Match '\?\?'
         $text | Should -Not -Match '\?\.\w'
@@ -119,7 +119,7 @@ Describe 'Windows Sandbox bootstrap script' {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($sandbox, [ref]$null, [ref]$null)
         $topLevel = $ast.EndBlock.Statements
         foreach ($st in $topLevel) {
-            $st.FindAll({ param($n) ($n -is [System.Management.Automation.Language.BreakStatementAst] -or $n -is [System.Management.Automation.Language.ReturnStatementAst]) -and
+            $st.FindAll({ param($n) ($n -is [System.Management.Automation.Language.BreakStatementAst] -or $n -is [System.Management.Automation.Language.ReturnStatementAst] -or $n -is [System.Management.Automation.Language.ExitStatementAst]) -and
                     -not ($n.Parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
                     ($n.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) -eq $null) }, $false) |
                 Where-Object { $_.Extent.StartLineNumber -gt 0 } |

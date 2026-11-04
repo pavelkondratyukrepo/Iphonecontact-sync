@@ -131,7 +131,13 @@ function Get-MgGroup {
     if ($Filter -notmatch "displayName eq '(.+)'") { throw "FakeGraph: unsupported group filter '$Filter'" }
     $name = $Matches[1].Replace("''", "'")
     if ($global:FakeTenant.Groups.ContainsKey($name)) {
-        return [pscustomobject]@{ Id = $global:FakeTenant.Groups[$name].id; DisplayName = $name }
+        $out = @([pscustomobject]@{ Id = $global:FakeTenant.Groups[$name].id; DisplayName = $name })
+        # A second group with the same display name (Entra allows it); the runbooks must refuse to guess.
+        if ($global:FakeTenant.ContainsKey('DuplicateGroupNames') -and $global:FakeTenant.DuplicateGroupNames -contains $name) {
+            $out += [pscustomobject]@{ Id = "$($global:FakeTenant.Groups[$name].id)-twin"; DisplayName = $name }
+        }
+        if ($Top -gt 0) { $out = @($out | Select-Object -First $Top) }
+        return $out
     }
 }
 

@@ -9,7 +9,7 @@
     Run from an admin workstation as an Intune Administrator. Idempotent: policies are matched by display name.
 
     (a) iOS App Protection Policy (APP) targeting Microsoft Outlook, for apps on Intune-managed devices.
-        The one setting this project needs is Data protection > Data transfer >
+        The one setting this project needs is Data protection > Functionality >
         "Sync policy managed app data with native apps or add-ins" = Allow, which is contactSyncBlocked = false in Graph.
         If a policy with -AppProtectionPolicyName already exists, ONLY that setting is changed, Outlook is added to its
         target apps if missing, and the group is added to its assignments. All other settings keep your existing values.

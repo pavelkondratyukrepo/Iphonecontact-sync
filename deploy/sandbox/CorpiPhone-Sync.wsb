@@ -23,5 +23,5 @@
   </LogonCommand>
   <Networking>Default</Networking>
   <MemoryInMB>8192</MemoryInMB>
-  <ClipboardRedirection>true</ClipboardRedirection>
+  <ClipboardRedirection>Enable</ClipboardRedirection>
 </Configuration>

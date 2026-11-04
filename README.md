@@ -64,14 +64,17 @@ The suite needs no modules from the Graph SDK and no network. It runs the runboo
 | --- | --- |
 | Runbook identity | System-assigned managed identity on the Automation account. `Connect-MgGraph -Identity`. No app registration, certificate or secret. |
 | Graph application permissions | `DeviceManagementManagedDevices.Read.All`, `User.ReadWrite.All`, `GroupMember.Read.All`, `RoleManagement.Read.Directory`. |
-| Contacts access | Exchange RBAC for Applications only: role `Application Contacts.ReadWrite`, scope `CustomAttribute1 -eq 'CorpiPhone'`. **Never consent `Contacts.ReadWrite` in Entra.** Entra and Exchange grants are a union; an unscoped Entra grant would silently remove the mailbox scoping. Both deploy scripts check for this and warn. |
+| Contacts access | Exchange RBAC for Applications only: role `Application Contacts.ReadWrite`, scope `CustomAttribute1 -eq 'CorpiPhone'`. **Never consent `Contacts.ReadWrite` in Entra.** Entra and Exchange grants are a union; an unscoped Entra grant would silently remove the mailbox scoping. Deploy-Automation.ps1 stops if it finds such a grant, New-ExchangeAppScope.ps1 shows a red banner, and Runbook 2 refuses to run while the identity holds one. |
 | Control group | `SG-CorpiPhone-Users`, dynamic, rule `(user.extensionAttribute1 -eq "CorpiPhone")`. Filled by Runbook 1, never edited by hand. Needs Entra ID P1. |
 | Exclusion group | `SG-Directory-Exclude`, static. Members receive contacts but are not listed, and Runbook 1 does not write their number. |
 | Schedules | Automation schedules linked with `WhatIf = false` and the group names as parameters. |
-| Logging | Job output stream (one line per change plus a summary object) and warning stream (throttling retries). Kept in job history. |
-| Alerting | Azure Monitor metric alert on `TotalJob` with `Status` in Failed, Suspended, emailing the address passed to the deploy script. |
+| Logging | Job output stream (one line per change plus a summary object) and warning stream (throttling retries, phones without a primary user). Kept in job history. |
+| Alerting | Azure Monitor metric alert on `TotalJob` with `Status` in Failed, Suspended, Stopped, emailing the address passed to the deploy script. |
+| Who can change the runbooks | Anyone with Owner, Contributor or Automation Contributor on the resource group can edit a runbook and run any code as the managed identity, which can write every user's profile. Keep the resource group dedicated to this project, give those roles to the two or three owning admins only, and give operators **Automation Job Operator** (start jobs, read output) instead. Optionally add a `CanNotDelete` lock and an Activity Log alert on `Microsoft.Automation/automationAccounts/runbooks/write` and `.../publish/action`. |
 
-Things this deliberately does not touch: MFA phone registration (the authentication methods API is never called), users' personal contacts (only contacts carrying the `DirectorySourceId` extended property are read, modified or deleted), and Outlook's own GAL behavior.
+Things this deliberately does not touch: MFA phone registration (the authentication methods API is never called), users' personal contacts (the listing returns every contact in the default folder so the runbook can find its own; contacts without the `DirectorySourceId` extended property are discarded at once, never logged, kept, modified or deleted), and Outlook's own GAL behavior. `mobilePhone` is a profile attribute, not an authentication method; during the pilot, open My Security Info for one pilot user and confirm the corporate number is not offered as a password-reset method.
+
+**Privacy of job output.** Job output holds user principal names, old and new mobile numbers, device names and coworker names. Azure Automation keeps job output for 30 days, readable by anyone with Reader or above on the Automation account; if you forward job streams to Log Analytics, it is kept for that workspace's retention instead. The CHANGE lines are the audit trail of what the runbooks did.
 
 ## Runbook parameters
 
@@ -129,7 +132,7 @@ Intune cannot change the primary user of an iOS device (that action is Windows o
 ## Rollback
 
 - Stop contacts arriving: disable the two schedules.
-- Remove the directory from phones: unassign the ACP, or set Save Contacts to off in it. Outlook stops syncing and removes the native entries on the next policy refresh.
+- Remove the directory from phones: unassign the ACP, or set Save Contacts to off in it. Outlook stops syncing on the next policy refresh. Microsoft does not document whether Outlook then removes the entries it already put in native Contacts, so check one pilot phone. If you also want the cards gone, remove them from the mailboxes (next bullet) first, while Outlook is still syncing, so the deletions reach the phones.
 - Remove the contacts from mailboxes while keeping scope: nest `SG-CorpiPhone-Users` inside `SG-Directory-Exclude` (exclusions are read transitively), start `Sync-DirectoryToMailboxes` live once. With everyone excluded the directory is empty, so the runbook deletes every tagged contact and touches nothing else. Then remove the nesting.
 - Remove the stamp (only after the step above, since the runbook can no longer reach an unstamped mailbox): clear `extensionAttribute1` on the users with `Update-MgUser -UserId <id> -OnPremisesExtensionAttributes @{ extensionAttribute1 = $null }` (cloud-only users; synced users in on-premises AD). The Entra portal does not show this attribute. The dynamic group empties and the Exchange scope matches nobody.
 - Full teardown: remove the Exchange role assignment and scope, delete the Automation account, delete the two groups.
@@ -155,7 +158,7 @@ Intune cannot change the primary user of an iOS device (that action is Windows o
 **No mailbox.** Skip reason `NoMailbox` (404). The member has no Exchange Online mailbox or REST is not enabled for it. Nothing to fix unless the user should have a mailbox.
 
 **Outlook contacts not appearing in the native app.** In order:
-1. APP: Data protection > Data transfer > *Sync policy managed app data with native apps or add-ins* must be Allow on the policy the device receives. Check Intune > Apps > App protection policies > the policy > Properties, and the device's App protection status report.
+1. APP: Data protection > Functionality > *Sync policy managed app data with native apps or add-ins* must be Allow on the policy the device receives. Check Intune > Apps > Protection (older portal: App protection policies) > the policy > Properties, and the device's App protection status report.
 2. ACP: *Save Contacts* = Yes on the managed-apps ACP assigned to the user. Check the Outlook settings page on the phone under the account: Save Contacts should show on and locked.
 3. iOS Contacts permission denied: iOS Settings > Outlook > Contacts must be on. Outlook also shows an *Open Settings* link under the account when denied.
 4. Device restriction profiles assigned to the phone (Intune > Devices > iOS/iPadOS > Configuration > Device restrictions > App Store, Doc Viewing, Gaming):

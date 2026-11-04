@@ -208,8 +208,8 @@ The other two names, `rg-corpiphone-sync` and `aa-corpiphone-sync`, are suggesti
 | `Ensuring static exclusion group` | Creates the "receive but do not list" group | seconds |
 | `Ensuring resource group` / `Ensuring Automation account` | Creates the Azure pieces | 1 minute |
 | `Waiting for the identity's service principal` | Azure is publishing the account's login to Entra | up to 2 minutes |
-| `Granting Graph application permissions` | Four lines ending in `granted` | seconds |
-| `verified: no Contacts.* permission` | Important safety check passed |  |
+| `Granting Graph application permissions` | Four lines starting with `granted` (or `exists` on a re-run) | seconds |
+| `verified: no Contacts.* permission` | Important safety check passed. If the script stops here with red text about an unscoped Contacts permission, remove it as the text says and run again |  |
 | `Ensuring PowerShell 7.4 runtime environment` | Creates the engine the runbooks run on | seconds |
 | `Adding Microsoft.Graph 2.40.0 modules` | Five lines, each ending `imported`. **This is the slow part.** | 2 to 4 minutes each |
 | `Importing and publishing runbooks` | Two lines ending `published` | 1 minute |
@@ -263,7 +263,7 @@ This is the one step where the *way* the permission is granted matters for priva
 2. **Sign-in (Exchange).** A device code appears. Use your admin account. This one can take a little longer to come back; give it a minute.
 3. The script prints `created` or `exists` for three things: the service principal, the management scope `CorpiPhoneMailboxes`, and the role assignment.
 4. A yellow note reminds you that Exchange needs 30 minutes to 2 hours before the permission is active for real runs. That is normal and expected.
-5. **Sign-in (Graph).** A second device code appears for the safety check. Same steps.
+5. The InScope table described in 2.3 prints next. Then, **Sign-in (Graph):** a second device code appears for the safety check. Same steps. The green or red result of that check prints after you sign in.
 
 ### 2.3 Read the results
 
@@ -368,7 +368,7 @@ In the PowerShell 7 window:
 2. The script prints `created` for the App Protection Policy and the App Configuration Policy, `target apps updated` for each, and `assigned to group`.
 3. It ends with a green box listing two device-restriction settings to verify by hand. Read 4.4 below.
 
-**If your company already has an App Protection Policy for Outlook on iPhones**, do not create a second one. Find its exact name in intune.microsoft.com under **Apps**, **App protection policies**, and run the script with that name added: `-AppProtectionPolicyName '<exact existing name>'`. The script then changes only the one setting it needs and leaves the rest of your policy alone.
+**If your company already has an App Protection Policy for Outlook on iPhones**, do not create a second one. Find its exact name in intune.microsoft.com under **Apps**, **Protection** (labelled **App protection policies** in older portal versions), and run the script with that name added: `-AppProtectionPolicyName '<exact existing name>'`. The script then changes only the one setting it needs and leaves the rest of your policy alone.
 
 ### 4.3 What pilot users will see
 
@@ -391,8 +391,8 @@ If your company has an iOS **Device restrictions** profile in Intune, one settin
 
 ### 4.5 Check it worked
 
-- [ ] In intune.microsoft.com, **Apps**, **App protection policies**: a policy named `iOS APP - Outlook (Intune managed devices)` (or your existing one) assigned to `SG-CorpiPhone-Pilot`.
-- [ ] **Apps**, **App configuration policies**: `ACP - Outlook contact sync (iOS and Android)` assigned to the same group.
+- [ ] In intune.microsoft.com, **Apps**, **Protection** (labelled **App protection policies** in older portal versions): a policy named `iOS APP - Outlook (Intune managed devices)` (or your existing one) assigned to `SG-CorpiPhone-Pilot`.
+- [ ] **Apps**, **Configuration** (labelled **App configuration policies** in older portal versions): `ACP - Outlook contact sync (iOS and Android)` assigned to the same group.
 - [ ] At least one pilot user has opened Outlook, tapped Allow, and an existing Outlook contact of theirs now appears in the iPhone's Contacts app. This proves the plumbing works before the directory arrives.
 
 ## Step 5: Put the directory into mailboxes, pilot first
@@ -504,7 +504,7 @@ Run the Step 4 command again with the real group name:
 ./deploy/New-OutlookContactSyncPolicies.ps1 -UseDeviceCode -GroupName SG-CorpiPhone-Users
 ```
 
-The script finds the two existing policies by name, leaves their settings alone, and **adds** `SG-CorpiPhone-Users` to their assignments. The pilot group stays assigned too, which does no harm; you can remove it later in intune.microsoft.com under **Apps**, **App protection policies**, the policy, **Properties**, **Edit** next to Assignments.
+The script finds the two existing policies by name, leaves their settings alone, and **adds** `SG-CorpiPhone-Users` to their assignments. The pilot group stays assigned too, which does no harm; you can remove it later in intune.microsoft.com under **Apps**, **Protection** (labelled **App protection policies** in older portal versions), the policy, **Properties**, **Edit** next to Assignments.
 
 If you closed the Sandbox since Step 5, repeat Step 0 first; it takes 15 minutes and nothing else is lost.
 
@@ -583,7 +583,7 @@ portal.azure.com, automation account, **Schedules**, open each schedule, **Enabl
 
 ### Level 2: Remove the directory from the phones
 
-In intune.microsoft.com, **Apps**, **App configuration policies**, open `ACP - Outlook contact sync (iOS and Android)`, **Properties**, **Edit** next to Assignments, remove the groups, **Review + save**. Outlook stops syncing and removes the directory entries from the phones' Contacts app the next time it checks in. Personal contacts are untouched.
+In intune.microsoft.com, **Apps**, **Configuration** (labelled **App configuration policies** in older portal versions), open `ACP - Outlook contact sync (iOS and Android)`, **Properties**, **Edit** next to Assignments, remove the groups, **Review + save**. Outlook stops syncing the next time it checks in. Microsoft does not document whether Outlook then removes the entries it already put in the Contacts app, so look at one phone. If you are going on to Level 3, do Level 3 first, while Outlook is still syncing, so the deletions reach the phones. Personal contacts are untouched.
 
 ### Level 3: Remove the contact cards from everyone's mailbox
 

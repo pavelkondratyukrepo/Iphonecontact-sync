@@ -32,6 +32,7 @@ function New-FakeTenant {
         FailPatchUsers     = @{}                                               # userId -> HTTP status to throw on PATCH /users/{id}
         FailBatchUrls      = @{}                                               # "METHOD url" -> status returned inside $batch (every time)
         BatchThrow         = 0                                                 # when > 0, the next $batch call throws this HTTP status once
+        BatchThrowAfterCommit = 0                                              # when > 0, the next $batch call applies its writes, then throws this status once
         LastHeaders        = @{}                                               # uri -> headers seen (for assertions)
         NextContactId      = 1
     }
@@ -120,7 +121,10 @@ function ConvertTo-PascalObject {
 # ------------------------------------------------------------------ SDK stubs -------------------------------------------------------------
 function Import-Module { param($Name) }
 function Connect-MgGraph { param([switch]$Identity, [switch]$NoWelcome, [string[]]$Scopes) }
-function Get-MgContext { [pscustomobject]@{ ClientId = 'fake-client'; TenantId = 'fake-tenant' } }
+function Get-MgContext {
+    $scopes = if ($global:FakeTenant -and $global:FakeTenant.ContainsKey('ContextScopes')) { $global:FakeTenant.ContextScopes } else { @('GroupMember.Read.All', 'User.ReadWrite.All', 'DeviceManagementManagedDevices.Read.All', 'RoleManagement.Read.Directory') }
+    [pscustomobject]@{ ClientId = 'fake-client'; TenantId = 'fake-tenant'; Scopes = $scopes }
+}
 
 function Get-MgGroup {
     param([string]$Filter, [string[]]$Property, [int]$Top)
@@ -250,6 +254,7 @@ function Invoke-MgGraphRequest {
                 }
             }
         }
+        if ($t.BatchThrowAfterCommit -gt 0) { $st = $t.BatchThrowAfterCommit; $t.BatchThrowAfterCommit = 0; throw (New-FakeHttpError -Status $st -Message 'gateway timeout after commit') }
         return @{ responses = @($responses) }
     }
     throw "FakeGraph: unsupported request $Method $Uri"

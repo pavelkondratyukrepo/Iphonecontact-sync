@@ -24,7 +24,8 @@
          target list (whose mailboxes receive contacts). Directory = enabled members minus exclusion-group members.
          Target = all enabled members, or the one user in -UserPrincipalName.
       2. Per target mailbox, list the contacts this runbook owns: those carrying the DirectorySourceId extended property.
-         Every other contact is untouchable and is never read, modified or deleted.
+         To find them the listing returns every contact in the default folder with the fields the runbook writes; contacts
+         without DirectorySourceId are discarded immediately, never logged or kept, and never modified or deleted.
       3. Reconcile, excluding the target's own entry: create when no owned contact has that coworker's id, PATCH when the stored
          hash differs from the hash of the current directory fields, when the fields on the contact itself no longer match
          (edited on the phone; -DetectLocalEdits), or always with -FullRebuild. DELETE owned contacts whose coworker left the
@@ -140,6 +141,20 @@ function Get-HttpStatusCode {
     return 0
 }
 
+function Get-RetryAfterFromError {
+    <# Best-effort read of a Retry-After header (seconds) off a Graph error record; 0 when absent. #>
+    param([Parameter(Mandatory)] [System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $resp = Get-Field -Object $ErrorRecord.Exception -Name 'Response'
+    $headers = Get-Field -Object $resp -Name 'Headers'
+    $ra = Get-Field -Object $headers -Name 'RetryAfter'
+    if ($null -eq $ra) { return 0 }
+    $delta = Get-Field -Object $ra -Name 'Delta'
+    if ($null -ne $delta) { return [int][Math]::Min(120, [Math]::Max(0, ([TimeSpan]$delta).TotalSeconds)) }
+    $date = Get-Field -Object $ra -Name 'Date'
+    if ($null -ne $date) { return [int][Math]::Min(120, [Math]::Max(0, (([DateTimeOffset]$date) - [DateTimeOffset]::UtcNow).TotalSeconds)) }
+    return 0
+}
+
 function Invoke-GraphRequestWithRetry {
     param(
         [Parameter(Mandatory)] [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')] [string]$Method,
@@ -161,6 +176,8 @@ function Invoke-GraphRequestWithRetry {
             $status = Get-HttpStatusCode -ErrorRecord $_
             if ($status -in @(429, 500, 502, 503, 504) -and $attempt -lt $MaxAttempts) {
                 $delay = [Math]::Min(60, [Math]::Pow(2, $attempt)) + (Get-Random -Minimum 0 -Maximum 3)
+                $retryAfter = Get-RetryAfterFromError -ErrorRecord $_
+                if ($retryAfter -gt $delay) { $delay = $retryAfter }
                 Write-SyncLog -Level WARN -Message "Graph $Method $Uri returned $status, retrying in $delay s (attempt $attempt of $MaxAttempts)"
                 Start-Sleep -Seconds $delay
                 continue
@@ -520,6 +537,7 @@ $summary = [ordered]@{
     ContactsDeleted    = 0
     ContactsUnchanged  = 0
     LocalEditsReverted = 0
+    DuplicatesRemoved  = 0
     MailboxesNotReached = 0
     MailboxesSkipped   = [ordered]@{}
     Errors             = 0
@@ -550,6 +568,19 @@ Connect-MgGraph -Identity -NoWelcome
 $ctx = Get-MgContext
 if (-not $ctx) { throw 'Connect-MgGraph -Identity did not produce a Graph context. Is the system-assigned managed identity enabled?' }
 Write-SyncLog "Connected to Graph as managed identity (client $($ctx.ClientId)) in tenant $($ctx.TenantId)"
+# Guard: a Contacts.* permission granted in Entra is tenant-wide and silently overrides the Exchange RBAC mailbox scope
+# (Entra and Exchange grants are a union). Refuse to run rather than write with unscoped access.
+$appRoles = @(Get-Field -Object $ctx -Name 'Scopes') | Where-Object { $_ }
+if (@($appRoles).Count -eq 0) {
+    Write-SyncLog -Level WARN -Message 'Could not read the identity''s application permissions from the Graph context; the unscoped-Contacts guard did not run.'
+}
+else {
+    Write-SyncLog "Identity application permissions: $(@($appRoles | Sort-Object) -join ', ')"
+    $unscoped = @($appRoles | Where-Object { $_ -match '^Contacts\.' })
+    if ($unscoped.Count -gt 0) {
+        throw "The managed identity holds $($unscoped -join ', ') in Entra. That grant is tenant-wide and defeats the Exchange mailbox scope, so this runbook refuses to run. Remove it in Entra (Enterprise applications > the identity > Permissions) and re-run."
+    }
+}
 
 # --- 1. members ------------------------------------------------------------------------------------------------------
 $groupId = Get-GroupIdByName -DisplayName $GroupName
@@ -627,8 +658,8 @@ foreach ($target in $targets) {
     }
 
     if ($WhatIf) {
-        foreach ($id in $actionById.Keys | Sort-Object) {
-            Write-SyncLog -Level CHANGE -Message "WHATIF $($actionById[$id].Action) mailbox=$upn $($actionById[$id].Label)"
+        foreach ($r in $requests) {
+            Write-SyncLog -Level CHANGE -Message "WHATIF $($actionById[$r.id].Action) mailbox=$upn $($actionById[$r.id].Label)"
         }
         $summary.ContactsAdded += $plan.Creates.Count
         $summary.ContactsUpdated += $plan.Updates.Count
@@ -650,19 +681,25 @@ foreach ($target in $targets) {
             continue
         }
         $mailboxForbidden = $false
-        foreach ($id in $actionById.Keys | Sort-Object) {
+        $createsDone = 0
+        foreach ($r in $requests) {
+            $id = $r.id
             $action = $actionById[$id]
             $res = $results[$id]
             $status = if ($null -ne $res) { $res.Status } else { 0 }
             if ($status -ge 200 -and $status -lt 300) {
                 switch ($action.Action) {
-                    'CREATE' { $summary.ContactsAdded++ }
+                    'CREATE' { $summary.ContactsAdded++; $createsDone++ }
                     'UPDATE' { $summary.ContactsUpdated++; if ($action.Contains('LocalEdit') -and $action.LocalEdit) { $summary.LocalEditsReverted++ } }
                     'DELETE' { $summary.ContactsDeleted++ }
                 }
                 Write-SyncLog -Level CHANGE -Message "APPLY $($action.Action) mailbox=$upn $($action.Label)"
             }
             elseif ($status -eq 403) { $mailboxForbidden = $true }
+            elseif ($status -eq 404 -and $action.Action -eq 'UPDATE') {
+                # The user deleted the card between listing and writing. Not an error: the next run re-creates it.
+                Write-SyncLog -Level WARN -Message "UPDATE skipped in mailbox $upn for $($action.Label): the card was deleted in the meantime and is re-created on the next run"
+            }
             elseif ($status -eq 404 -and $action.Action -eq 'DELETE') {
                 # Already gone (user deleted it by hand): the desired state holds.
                 $summary.ContactsDeleted++
@@ -675,6 +712,26 @@ foreach ($target in $targets) {
         if ($mailboxForbidden) {
             Add-Skip -Reason 'AccessDenied' -Detail "$upn : 403 on write. The Exchange RBAC scope has not caught up with a fresh stamp (30 min to 2 h). Re-run later."
             continue
+        }
+        if ($createsDone -gt 0) {
+            # Duplicate sweep. A retried $batch call (timeout or 5xx after Exchange had already committed some creates), or a
+            # second run overlapping this one, can leave two cards for one coworker. Re-list and remove the extras now
+            # instead of leaving them on the phone until next week.
+            try {
+                $after = @(Get-OwnedContacts -UserId $target.Id)
+                $dupes = @((Resolve-MailboxChanges -Directory @() -TargetUserId $target.Id -OwnedContacts $after).Deletes | Where-Object { $_.Reason -eq 'duplicate' })
+                if ($dupes.Count -gt 0) {
+                    $n = 0
+                    $sweep = foreach ($d in $dupes) { $n++; @{ id = "x$n"; method = 'DELETE'; url = "/users/$($target.Id)/contacts/$($d.Contact.ContactId)"; body = $null } }
+                    $sweepResults = Invoke-GraphBatch -Requests @($sweep)
+                    $removed = @($sweepResults.Values | Where-Object { ($_.Status -ge 200 -and $_.Status -lt 300) -or $_.Status -eq 404 }).Count
+                    $summary.DuplicatesRemoved += $removed
+                    Write-SyncLog -Level CHANGE -Message "APPLY DELETE mailbox=$upn removed $removed duplicate card(s) left by a retried or overlapping write"
+                }
+            }
+            catch {
+                Write-SyncLog -Level WARN -Message "Duplicate check after writing failed for $upn ($($_.Exception.Message)); the next run removes any duplicates."
+            }
         }
     }
     $summary.MailboxesProcessed++
@@ -690,7 +747,7 @@ if ($summary.MailboxesTargeted -gt 0 -and $summary.MailboxesProcessed -eq 0 -and
         Add-Error "None of the $($summary.MailboxesTargeted) targeted mailboxes could be processed. See the SKIP lines above."
     }
 }
-Write-SyncLog "Sync-DirectoryToMailboxes finished. Directory=$($summary.DirectorySize) Targeted=$($summary.MailboxesTargeted) Processed=$($summary.MailboxesProcessed) Added=$($summary.ContactsAdded) Updated=$($summary.ContactsUpdated) Deleted=$($summary.ContactsDeleted) Unchanged=$($summary.ContactsUnchanged) LocalEditsReverted=$($summary.LocalEditsReverted) Skipped=$(($summary.MailboxesSkipped.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') Errors=$($summary.Errors)"
+Write-SyncLog "Sync-DirectoryToMailboxes finished. Directory=$($summary.DirectorySize) Targeted=$($summary.MailboxesTargeted) Processed=$($summary.MailboxesProcessed) Added=$($summary.ContactsAdded) Updated=$($summary.ContactsUpdated) Deleted=$($summary.ContactsDeleted) Unchanged=$($summary.ContactsUnchanged) LocalEditsReverted=$($summary.LocalEditsReverted) DuplicatesRemoved=$($summary.DuplicatesRemoved) Skipped=$(($summary.MailboxesSkipped.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') Errors=$($summary.Errors)"
 [pscustomobject]$summary
 
 if ($summary.Errors -gt 0) {

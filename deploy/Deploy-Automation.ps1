@@ -85,8 +85,8 @@ param(
     [Parameter(Mandatory)] [string]$AlertEmail,
     [string]$ControlGroupName = 'SG-CorpiPhone-Users',
     [string]$ExclusionGroupName = 'SG-Directory-Exclude',
-    [string]$ScopeAttributeName = 'extensionAttribute1',
-    [string]$ScopeAttributeValue = 'CorpiPhone',
+    [ValidatePattern('^extensionAttribute([1-9]|1[0-5])$')] [string]$ScopeAttributeName = 'extensionAttribute1',
+    [ValidatePattern('^[A-Za-z0-9_-]{1,64}$')] [string]$ScopeAttributeValue = 'CorpiPhone',
     [string]$GraphModuleVersion = '2.40.0',
     [string]$RuntimeEnvironmentName = 'PowerShell74-GraphSync',
     [string]$ScheduleTimeZone = 'America/New_York',
@@ -191,6 +191,16 @@ function Get-ArmOrNull {
     return ($resp.Content | ConvertFrom-Json -Depth 20)
 }
 
+function Get-SingleGroupByName {
+    <# Same rule as the runbooks: escape quotes, refuse duplicates, so a deploy never binds an arbitrary same-named group. #>
+    param([Parameter(Mandatory)] [string]$DisplayName, [string[]]$Property = @('Id', 'DisplayName'))
+    $escaped = $DisplayName.Replace("'", "''")
+    $found = @(Get-MgGroup -Filter "displayName eq '$escaped'" -Property $Property -Top 2)
+    if ($found.Count -gt 1) { throw "More than one group is named '$DisplayName'. Group names used by this project must be unique." }
+    if ($found.Count -eq 1) { return $found[0] }
+    return $null
+}
+
 function Get-NextOccurrence {
     <#
         Returns the next wall-clock occurrence of $Hour:00 in $TimeZoneId (optionally on $DayOfWeek) as a UTC DateTimeOffset
@@ -207,8 +217,9 @@ function Get-NextOccurrence {
     while (($candidate -le $nowLocal.AddMinutes(15)) -or ($PSBoundParameters.ContainsKey('DayOfWeek') -and $candidate.DayOfWeek -ne $DayOfWeek)) {
         $candidate = $candidate.AddDays(1)
     }
-    $utc = [TimeZoneInfo]::ConvertTimeToUtc($candidate, $tz)
-    return [DateTimeOffset]::new($utc, [TimeSpan]::Zero)
+    # Wall-clock time with the zone's own offset: unambiguous whether the service reads StartTime as an instant or adds
+    # the -TimeZone offset to it. The created schedule's NextRun is printed so the operator can confirm.
+    return [DateTimeOffset]::new($candidate, $tz.GetUtcOffset($candidate))
 }
 
 function Wait-ForCondition {
@@ -248,7 +259,7 @@ Connect-GraphInteractive -Scopes 'Group.ReadWrite.All', 'AppRoleAssignment.ReadW
 # ----------------------------------------------------------------------------------------------------------------
 Write-Step "Ensuring dynamic group '$ControlGroupName'"
 $membershipRule = "(user.$ScopeAttributeName -eq `"$ScopeAttributeValue`")"
-$controlGroup = Get-MgGroup -Filter "displayName eq '$ControlGroupName'" -Property Id, DisplayName, GroupTypes, MembershipRule | Select-Object -First 1
+$controlGroup = Get-SingleGroupByName -DisplayName $ControlGroupName -Property Id, DisplayName, GroupTypes, MembershipRule
 if (-not $controlGroup) {
     $controlGroup = New-MgGroup -DisplayName $ControlGroupName `
         -Description "Corporate iPhone holders. Filled automatically by the Sync-IntuneToEntra runbook through $ScopeAttributeName. Do not edit by hand." `
@@ -267,7 +278,7 @@ else {
 }
 
 Write-Step "Ensuring static exclusion group '$ExclusionGroupName'"
-$exclusionGroup = Get-MgGroup -Filter "displayName eq '$ExclusionGroupName'" -Property Id, DisplayName | Select-Object -First 1
+$exclusionGroup = Get-SingleGroupByName -DisplayName $ExclusionGroupName
 if (-not $exclusionGroup) {
     $exclusionGroup = New-MgGroup -DisplayName $ExclusionGroupName `
         -Description 'Members receive Company Directory contacts but are not listed in the directory, and their phone number is not written to mobilePhone.' `
@@ -345,6 +356,8 @@ if ($badAssignments) {
         Write-Warning "The identity holds Graph permission '$value' in Entra. This is an UNSCOPED grant and makes the Exchange mailbox scope meaningless."
         Write-Warning "  Remove it with: Remove-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $identityObjectId -AppRoleAssignmentId $($bad.Id)"
     }
+    # Runbook 2 refuses to run with such a grant anyway; stop here so the problem is fixed before anything is deployed on top.
+    throw 'Unscoped Contacts.* permission found on the identity. Remove it (commands above) and re-run.'
 }
 else { Write-Host '  verified: no Contacts.* permission on the identity (contacts access comes only from Exchange RBAC)' }
 
@@ -390,7 +403,7 @@ foreach ($module in $GraphModules) {
     }
     $final = Wait-ForCondition -Description "$module $GraphModuleVersion import" -TimeoutSeconds 900 -IntervalSeconds 15 -Condition {
         $p = Get-ArmOrNull -Path $pkgPath
-        if ($p -and $p.properties.provisioningState -in @('Succeeded', 'Failed')) { $p } else { $null }
+        if ($p -and $p.properties.provisioningState -in @('Succeeded', 'Failed', 'Canceled')) { $p } else { $null }
     }
     if ($final.properties.provisioningState -ne 'Succeeded') {
         throw "Module $module $GraphModuleVersion failed to import into the runtime environment: $($final.properties | ConvertTo-Json -Depth 5 -Compress)"
@@ -449,7 +462,9 @@ foreach ($rb in $Runbooks) {
     $null = Wait-ForCondition -Description "$($rb.Name) draft content upload" -TimeoutSeconds 180 -IntervalSeconds 5 -Condition {
         try {
             $draft = Invoke-RestMethod -Method Get -Uri $contentUri -Headers @{ Authorization = "Bearer $armToken" }
-            if (($draft -is [string]) -and ($draft.Trim() -eq $content.Trim())) { $true } else { $null }
+            # Compare ignoring line endings and a BOM: the service may store CRLF as LF.
+            $norm = { param($t) ([string]$t).TrimStart([char]0xFEFF).Replace("`r`n", "`n").Trim() }
+            if (($draft -is [string]) -and ((& $norm $draft) -eq (& $norm $content))) { $true } else { $null }
         }
         catch { $null }
     }
@@ -518,7 +533,7 @@ else {
                 $schedule = New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $def.Name `
                     -StartTime $def.StartTime -DayInterval 1 -TimeZone $ScheduleTimeZone
             }
-            Write-Host "  created schedule $($def.Name) (first run $($def.StartTime.ToString('u')))"
+            Write-Host "  created schedule $($def.Name) (first run $($def.StartTime.ToString('yyyy-MM-dd HH:mm zzz')) = $($schedule.NextRun) as Azure reports it; must be $($def.StartTime.Hour):00 $ScheduleTimeZone)"
         }
         else { Write-Host "  exists  schedule $($def.Name)" }
 

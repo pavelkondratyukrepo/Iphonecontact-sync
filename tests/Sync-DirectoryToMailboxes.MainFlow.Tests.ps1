@@ -307,6 +307,35 @@ Describe 'Sync-DirectoryToMailboxes main flow' {
             $run.Summary.MailboxesProcessed | Should -Be 5
         }
 
+        It 'removes duplicates when a $batch call is retried after Exchange already committed the creates' {
+            $null = New-Scenario
+            $global:FakeTenant.BatchThrowAfterCommit = 504
+            $run = Invoke-RunbookCatching -Parameters @{ WhatIf = $false; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $run.Error | Should -BeNullOrEmpty
+            $run.Summary.DuplicatesRemoved | Should -BeGreaterThan 0
+            foreach ($box in 'u1', 'u2', 'u3', 'u7', 'u8') {
+                $ids = @(Get-SourceIds $box)
+                $ids.Count | Should -Be @($ids | Select-Object -Unique).Count -Because "mailbox $box must hold one card per coworker"
+            }
+            ($run.Lines -join "`n") | Should -Match 'duplicate card\(s\) left by a retried or overlapping write'
+        }
+
+        It 'treats a card deleted by the user between listing and update as a warning, not an error' {
+            $null = New-Scenario
+            $global:FakeTenant.FailBatchUrls['PATCH /users/u1/contacts/c3'] = 404
+            $run = Invoke-RunbookCatching -Parameters @{ WhatIf = $false; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            $run.Error | Should -BeNullOrEmpty
+            $run.Summary.Errors | Should -Be 0
+        }
+
+        It 'refuses to run when the identity holds a Contacts permission in Entra (unscoped grant)' {
+            $null = New-Scenario
+            $global:FakeTenant.ContextScopes = @('GroupMember.Read.All', 'User.ReadWrite.All', 'Contacts.ReadWrite')
+            $run = Invoke-RunbookCatching -Parameters @{ WhatIf = $true; GroupName = 'SG-CorpiPhone-Users'; ExclusionGroupName = 'SG-Directory-Exclude' }
+            "$($run.Error)" | Should -Match 'holds Contacts\.ReadWrite in Entra'
+            $global:FakeTenant.BatchCalls | Should -Be 0
+        }
+
         It 'fails the job when every targeted mailbox returns 403 (broken RBAC assignment, not scope lag)' {
             $null = New-Scenario
             foreach ($id in 'u1', 'u2', 'u3', 'u5', 'u6', 'u7', 'u8') { $null = $global:FakeTenant.ForbiddenMailboxes.Add($id) }

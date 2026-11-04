@@ -12,7 +12,7 @@
 
     Required Graph application permissions on the managed identity:
         GroupMember.Read.All   read the control and exclusion groups
-        User.ReadWrite.All     read member profiles (granted for Runbook 1; User.Read.All would be enough for this runbook)
+        User.ReadUpdate.All    read member profiles (granted for Runbook 1; User.Read.All would be enough for this runbook)
 
     Contacts access: NO Graph permission in Entra. Do not consent Contacts.ReadWrite to the identity. Mailbox access comes
     only from Exchange RBAC for Applications (deploy/New-ExchangeAppScope.ps1): role 'Application Contacts.ReadWrite' with a

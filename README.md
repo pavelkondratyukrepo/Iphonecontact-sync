@@ -34,7 +34,7 @@ Everything tenant-specific (ids, names, addresses) is a script parameter. Nothin
 
 Follow the Deployment guide for the hands-on steps. The order is dictated by the data flow:
 
-1. `deploy/Deploy-Automation.ps1` creates the groups, the Automation account with its system-assigned managed identity, the four Graph application permissions, the PowerShell 7.6 runtime environment (`-PowerShellVersion 7.4` as a fallback) with `Microsoft.Graph` pinned to 2.40.0, imports and publishes both runbooks, creates the schedules (disabled) and the alert rule. It prints the identity's application id and object id.
+1. `deploy/Deploy-Automation.ps1` creates the groups, the Automation account with its system-assigned managed identity, the five Graph application permissions, the PowerShell 7.6 runtime environment (`-PowerShellVersion 7.4` as a fallback) with `Microsoft.Graph` pinned to 2.40.0, imports and publishes both runbooks, creates the schedules (disabled) and the alert rule. It prints the identity's application id and object id.
 2. `deploy/New-ExchangeAppScope.ps1` registers the identity in Exchange Online, creates the `CorpiPhoneMailboxes` scope on `CustomAttribute1 -eq 'CorpiPhone'`, assigns `Application Contacts.ReadWrite` restricted to it, runs `Test-ServicePrincipalAuthorization`, and checks Entra for a `Contacts.*` grant that must not exist.
 3. Runbook 1 `Sync-IntuneToEntra`, first with `WhatIf = true`, then live. The stamp and the dynamic group now exist.
 4. `deploy/New-OutlookContactSyncPolicies.ps1` creates the APP and ACP and assigns them to a pilot group, later to `SG-CorpiPhone-Users`.
@@ -63,7 +63,7 @@ The suite needs no modules from the Graph SDK and no network. It runs the runboo
 | Item | Setting |
 | --- | --- |
 | Runbook identity | System-assigned managed identity on the Automation account. `Connect-MgGraph -Identity`. No app registration, certificate or secret. |
-| Graph application permissions | `DeviceManagementManagedDevices.Read.All`, `User.ReadWrite.All`, `GroupMember.Read.All`, `RoleManagement.Read.Directory`. |
+| Graph application permissions | `DeviceManagementManagedDevices.Read.All`, `User.ReadUpdate.All`, `User-Phone.ReadWrite.All`, `GroupMember.Read.All`, `RoleManagement.Read.Directory`. These are the least privileged roles Microsoft documents for the user updates the runbooks make; unlike `User.ReadWrite.All` they cannot create or delete users. If the first live run of Runbook 1 fails with `Authorization_RequestDenied` on a stamp or number for a non-admin user, grant `User.ReadWrite.All` as a fallback and report it. |
 | Contacts access | Exchange RBAC for Applications only: role `Application Contacts.ReadWrite`, scope `CustomAttribute1 -eq 'CorpiPhone'`. **Never consent `Contacts.ReadWrite` in Entra.** Entra and Exchange grants are a union; an unscoped Entra grant would silently remove the mailbox scoping. Deploy-Automation.ps1 stops if it finds such a grant, New-ExchangeAppScope.ps1 shows a red banner, and Runbook 2 refuses to run while the identity holds one. |
 | Control group | `SG-CorpiPhone-Users`, dynamic, rule `(user.extensionAttribute1 -eq "CorpiPhone")`. Filled by Runbook 1, never edited by hand. Needs Entra ID P1. |
 | Exclusion group | `SG-Directory-Exclude`, static. Members receive contacts but are not listed, and Runbook 1 does not write their number. |
@@ -105,7 +105,7 @@ Both end with a summary object and throw if any error occurred, so the job shows
 
 ## Pilot checklist
 
-1. Groups, Automation account, identity, the four Graph permissions and the Exchange scope created. Confirm `Contacts.ReadWrite` is absent from the identity's Entra permissions (Enterprise applications > the identity > Permissions).
+1. Groups, Automation account, identity, the five Graph permissions and the Exchange scope created. Confirm `Contacts.ReadWrite` is absent from the identity's Entra permissions (Enterprise applications > the identity > Permissions).
 2. Runbook 1 with `WhatIf`: the stamp list matches the corporate iPhone primary users in Intune exactly. Fix primary users in Intune where wrong (retire and re-enroll; see Phone handover). Read the job's Warnings tab for phones without a primary user. Run live. Dynamic group fills within minutes.
 3. `Test-ServicePrincipalAuthorization` (re-run `New-ExchangeAppScope.ps1 -TestOnly`) shows the Contacts role in scope for a stamped user and not for an unstamped one.
 4. APP and ACP assigned to the pilot group. Users tap Allow; an existing Outlook contact appears in native Contacts.

@@ -122,7 +122,7 @@ function ConvertTo-PascalObject {
 function Import-Module { param($Name) }
 function Connect-MgGraph { param([switch]$Identity, [switch]$NoWelcome, [string[]]$Scopes) }
 function Get-MgContext {
-    $scopes = if ($global:FakeTenant -and $global:FakeTenant.ContainsKey('ContextScopes')) { $global:FakeTenant.ContextScopes } else { @('GroupMember.Read.All', 'User.ReadWrite.All', 'DeviceManagementManagedDevices.Read.All', 'RoleManagement.Read.Directory') }
+    $scopes = if ($global:FakeTenant -and $global:FakeTenant.ContainsKey('ContextScopes')) { $global:FakeTenant.ContextScopes } else { @('GroupMember.Read.All', 'User.ReadUpdate.All', 'User-Phone.ReadWrite.All', 'DeviceManagementManagedDevices.Read.All', 'RoleManagement.Read.Directory') }
     [pscustomobject]@{ ClientId = 'fake-client'; TenantId = 'fake-tenant'; Scopes = $scopes }
 }
 

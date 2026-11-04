@@ -16,7 +16,9 @@
          same 500 free job minutes a month as Free (expected use is 60 to 80), but keeps running past them at a tiny
          per-minute rate instead of refusing to run jobs for the rest of the month.
       3. Four Microsoft Graph application permissions on the identity:
-             DeviceManagementManagedDevices.Read.All, User.ReadWrite.All, GroupMember.Read.All, RoleManagement.Read.Directory
+             DeviceManagementManagedDevices.Read.All, User.ReadUpdate.All, User-Phone.ReadWrite.All, GroupMember.Read.All,
+             RoleManagement.Read.Directory. These are the least privileged roles Microsoft documents for updating a user
+             (User.ReadUpdate.All, which cannot create or delete users) and its phone numbers (User-Phone.ReadWrite.All).
          Deliberately NOT Contacts.ReadWrite. Microsoft documents that Entra grants and Exchange RBAC for Applications
          grants are a union, so an unscoped Entra grant would defeat the mailbox scope created by New-ExchangeAppScope.ps1.
       4. A PowerShell runtime environment (7.6 by default; 7.4 reaches end of support on 10 November 2026) with the
@@ -112,7 +114,8 @@ $ErrorActionPreference = 'Stop'
 $GraphAppId = '00000003-0000-0000-c000-000000000000'
 $RequiredGraphPermissions = @(
     'DeviceManagementManagedDevices.Read.All',
-    'User.ReadWrite.All',
+    'User.ReadUpdate.All',
+    'User-Phone.ReadWrite.All',
     'GroupMember.Read.All',
     'RoleManagement.Read.Directory'
 )
@@ -356,6 +359,13 @@ foreach ($permission in $RequiredGraphPermissions) {
     }
     $null = New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $identityObjectId -PrincipalId $identityObjectId -ResourceId $graphSp.Id -AppRoleId $role.Id
     Write-Host "  granted $permission"
+}
+
+# An earlier version granted User.ReadWrite.All, which can also create and delete users. It is no longer needed.
+$broadRole = $graphSp.AppRoles | Where-Object { $_.Value -eq 'User.ReadWrite.All' } | Select-Object -First 1
+$broad = @($existingAssignments | Where-Object { $broadRole -and $_.ResourceId -eq $graphSp.Id -and $_.AppRoleId -eq $broadRole.Id })
+if ($broad.Count -gt 0) {
+    Write-Warning "The identity still holds User.ReadWrite.All from an earlier deployment. After one clean live run of Sync-IntuneToEntra, remove it: Remove-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $identityObjectId -AppRoleAssignmentId $($broad[0].Id)"
 }
 
 # Guard: the identity must not hold any Contacts.* Graph permission, or the Exchange RBAC scope is defeated.

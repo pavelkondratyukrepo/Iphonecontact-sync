@@ -208,7 +208,7 @@ The other two names, `rg-corpiphone-sync` and `aa-corpiphone-sync`, are suggesti
 | `Ensuring static exclusion group` | Creates the "receive but do not list" group | seconds |
 | `Ensuring resource group` / `Ensuring Automation account` | Creates the Azure pieces | 1 minute |
 | `Waiting for the identity's service principal` | Azure is publishing the account's login to Entra | up to 2 minutes |
-| `Granting Graph application permissions` | Four lines starting with `granted` (or `exists` on a re-run) | seconds |
+| `Granting Graph application permissions` | Five lines starting with `granted` (or `exists` on a re-run) | seconds |
 | `verified: no Contacts.* permission` | Important safety check passed. If the script stops here with red text about an unscoped Contacts permission, remove it as the text says and run again |  |
 | `Ensuring PowerShell 7.6 runtime environment` | Creates the engine the runbooks run on | seconds |
 | `Adding Microsoft.Graph 2.40.0 modules` | Five lines, each ending `imported`. **This is the slow part.** | 2 to 4 minutes each |
@@ -233,7 +233,7 @@ If you lose them: portal.azure.com, search for your automation account name, ope
 ### 1.5 Check it worked
 
 - [ ] In entra.microsoft.com, click **Groups**. You see `SG-CorpiPhone-Users` with membership type **Dynamic** and `SG-Directory-Exclude` with **Assigned**. Both are empty for now. That is correct.
-- [ ] Still in Entra, go to **Enterprise applications**, set the **Application type** filter to **Managed Identities**, and open `aa-corpiphone-sync`. Click **Permissions**. You see exactly four: `DeviceManagementManagedDevices.Read.All`, `User.ReadWrite.All`, `GroupMember.Read.All`, `RoleManagement.Read.Directory`. You must **not** see anything starting with `Contacts`. If you do, stop and read "If something goes wrong".
+- [ ] Still in Entra, go to **Enterprise applications**, set the **Application type** filter to **Managed Identities**, and open `aa-corpiphone-sync`. Click **Permissions**. You see exactly five: `DeviceManagementManagedDevices.Read.All`, `User.ReadUpdate.All`, `User-Phone.ReadWrite.All`, `GroupMember.Read.All`, `RoleManagement.Read.Directory`. You must **not** see anything starting with `Contacts`. If you do, stop and read "If something goes wrong".
 - [ ] In portal.azure.com, open the automation account, click **Runbooks**. Two runbooks show status **Published**.
 
 **If people should receive the directory but not appear in it** (executives, security staff), add them now: in Entra, open `SG-Directory-Exclude`, click **Members**, **Add members**, pick them, **Select**.

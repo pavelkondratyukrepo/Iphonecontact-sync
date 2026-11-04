@@ -15,7 +15,8 @@
 
     Required Graph application permissions on the managed identity:
         DeviceManagementManagedDevices.Read.All   read managed devices
-        User.ReadWrite.All                        read users, write extensionAttribute1 and mobilePhone
+        User.ReadUpdate.All                       read users, write extensionAttribute1 (cannot create or delete users)
+        User-Phone.ReadWrite.All                  write mobilePhone
         GroupMember.Read.All                      read the exclusion group
         RoleManagement.Read.Directory             read active directory role assignments
 

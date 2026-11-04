@@ -29,6 +29,10 @@ function New-FakeTenant {
         BatchCalls         = 0
         ContactPageSize    = 2
         ThrottleOnce       = [System.Collections.Generic.HashSet[string]]::new()  # "METHOD url" to answer 429 exactly once
+        FailPatchUsers     = @{}                                               # userId -> HTTP status to throw on PATCH /users/{id}
+        FailBatchUrls      = @{}                                               # "METHOD url" -> status returned inside $batch (every time)
+        BatchThrow         = 0                                                 # when > 0, the next $batch call throws this HTTP status once
+        LastHeaders        = @{}                                               # uri -> headers seen (for assertions)
         NextContactId      = 1
     }
     return $global:FakeTenant
@@ -59,8 +63,8 @@ function Add-FakeUser {
 }
 
 function Add-FakeDevice {
-    param([string]$UserId, [string]$Upn, [string]$Phone, [string]$Sync = '2026-10-30T12:00:00Z', [string]$Serial = 'SER', [string]$Name = 'iPhone', [string]$Os = 'iOS', [string]$Owner = 'company')
-    $global:FakeTenant.Devices.Add(@{ id = [guid]::NewGuid().ToString(); userId = $UserId; userPrincipalName = $Upn; phoneNumber = $Phone; lastSyncDateTime = $Sync; serialNumber = $Serial; deviceName = $Name; operatingSystem = $Os; managedDeviceOwnerType = $Owner })
+    param([string]$UserId, [string]$Upn, [string]$Phone, [string]$Sync = '2026-10-30T12:00:00Z', [string]$Serial = 'SER', [string]$Name = 'iPhone', [string]$Os = 'iOS', [string]$Owner = 'company', [string]$Model = 'iPhone 15')
+    $global:FakeTenant.Devices.Add(@{ id = [guid]::NewGuid().ToString(); userId = $UserId; userPrincipalName = $Upn; phoneNumber = $Phone; lastSyncDateTime = $Sync; serialNumber = $Serial; deviceName = $Name; operatingSystem = $Os; managedDeviceOwnerType = $Owner; model = $Model })
 }
 
 function Add-FakeGroup {
@@ -87,8 +91,17 @@ function Add-FakeContact {
 }
 
 function New-FakeHttpError {
+    <#
+        Alternates between the two exception shapes the runbooks must understand: HttpRequestException with .StatusCode
+        (what the SDK surfaces on some paths) and HttpResponseException with .Response.StatusCode (what Invoke-MgGraphRequest
+        throws on non-success responses).
+    #>
     param([int]$Status, [string]$Message = 'simulated')
-    return [System.Net.Http.HttpRequestException]::new("Response status code does not indicate success: $Status ($Message).", $null, [System.Net.HttpStatusCode]$Status)
+    if ($Status % 2 -eq 0) {
+        return [System.Net.Http.HttpRequestException]::new("Response status code does not indicate success: $Status ($Message).", $null, [System.Net.HttpStatusCode]$Status)
+    }
+    $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]$Status)
+    return [Microsoft.PowerShell.Commands.HttpResponseException]::new("Response status code does not indicate success: $Status ($Message).", $response)
 }
 
 function ConvertTo-PascalObject {
@@ -120,6 +133,7 @@ function Get-MgGroup {
 
 function Get-MgUser {
     param([switch]$All, [int]$PageSize, [string]$ConsistencyLevel, [string]$CountVariable, [string]$Filter, [string[]]$Property)
+    if ($Filter) { throw "FakeGraph: the runbook must not filter users server-side (got '$Filter'); it reads all users and drops guests itself" }
     foreach ($u in $global:FakeTenant.Users) { ConvertTo-PascalObject -Table $u }
 }
 
@@ -131,14 +145,18 @@ function Get-MgDeviceManagementManagedDevice {
 }
 
 function Invoke-MgGraphRequest {
-    param([string]$Method, [string]$Uri, $Body, [string]$ContentType, [string]$OutputType)
+    param([string]$Method, [string]$Uri, $Body, [string]$ContentType, [string]$OutputType, [hashtable]$Headers)
     $t = $global:FakeTenant
     $path = ([uri]$Uri).AbsolutePath -replace '^/v1\.0', ''
     $query = [System.Web.HttpUtility]::ParseQueryString(([uri]$Uri).Query)
+    if ($null -ne $Headers) { $t.LastHeaders[$path] = $Headers }
 
-    # GET /groups/{id}/transitiveMembers/microsoft.graph.user
+    # GET /groups/{id}/transitiveMembers/microsoft.graph.user  (advanced query: requires ConsistencyLevel eventual + $count)
     if ($Method -eq 'GET' -and $path -match '^/groups/([^/]+)/transitiveMembers/microsoft\.graph\.user$') {
         $gid = $Matches[1]
+        if ($null -eq $Headers -or [string]$Headers['ConsistencyLevel'] -ne 'eventual' -or $query['$count'] -ne 'true') {
+            throw (New-FakeHttpError -Status 400 -Message 'Request_UnsupportedQuery: OData cast requires ConsistencyLevel eventual and $count=true')
+        }
         $group = $t.Groups.Values | Where-Object { $_.id -eq $gid } | Select-Object -First 1
         if (-not $group) { throw (New-FakeHttpError -Status 404 -Message 'group not found') }
         $members = @($t.Users | Where-Object { $group.members -contains $_.id } | ForEach-Object { $_.Clone() })
@@ -177,6 +195,7 @@ function Invoke-MgGraphRequest {
         $uid = $Matches[1]
         $u = $t.Users | Where-Object { $_.id -eq $uid } | Select-Object -First 1
         if (-not $u) { throw (New-FakeHttpError -Status 404 -Message 'user not found') }
+        if ($t.FailPatchUsers.ContainsKey($uid)) { throw (New-FakeHttpError -Status ([int]$t.FailPatchUsers[$uid]) -Message 'Authorization_RequestDenied') }
         $b = $Body | ConvertFrom-Json -AsHashtable
         $t.Patches.Add(@{ UserId = $uid; Body = $Body })
         if ($b.ContainsKey('onPremisesExtensionAttributes')) {
@@ -188,10 +207,12 @@ function Invoke-MgGraphRequest {
     # POST /$batch
     if ($Method -eq 'POST' -and $path -eq '/$batch') {
         $t.BatchCalls++
+        if ($t.BatchThrow -gt 0) { $st = $t.BatchThrow; $t.BatchThrow = 0; throw (New-FakeHttpError -Status $st -Message 'batch endpoint failure') }
         $b = $Body | ConvertFrom-Json -AsHashtable
         if ($b.requests.Count -gt 20) { throw 'FakeGraph: batch larger than 20 requests' }
         $responses = foreach ($r in $b.requests) {
             $key = "$($r.method) $($r.url)"
+            if ($t.FailBatchUrls.ContainsKey($key)) { @{ id = $r.id; status = [int]$t.FailBatchUrls[$key]; body = @{ error = @{ code = 'Simulated'; message = "forced $($t.FailBatchUrls[$key])" } } }; continue }
             if ($t.ThrottleOnce.Contains($key)) {
                 $null = $t.ThrottleOnce.Remove($key)
                 @{ id = $r.id; status = 429; headers = @{ 'Retry-After' = '0' } }

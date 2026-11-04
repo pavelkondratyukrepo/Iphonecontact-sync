@@ -20,14 +20,20 @@
         RoleManagement.Read.Directory             read active directory role assignments
 
     Logic
-      1. Read managed devices where operatingSystem eq 'iOS' and managedDeviceOwnerType eq 'company'. Drop devices without a primary user.
-      2. In-scope set = distinct primary users that are enabled member users.
+      1. Read managed devices where operatingSystem eq 'iOS' and managedDeviceOwnerType eq 'company', re-check both client-side,
+         keep only iPhone models (corporate iPads are ignored) and drop devices without a primary user.
+      2. In-scope set = distinct primary users that are enabled, non-guest users.
       3. Stamp: set extensionAttribute1 to -ScopeAttributeValue on in-scope users where it differs; clear it on users that carry
          the value but are no longer in scope (including disabled users). Only extensionAttribute1 is ever written.
          If any user carries a different, foreign value in extensionAttribute1 the runbook stops before writing anything.
       4. Phone: per user keep the device with the newest lastSyncDateTime, normalize its number to E.164 and write mobilePhone
          when it differs. The phone write (never the stamp) is skipped for exclusion-group members and for any principal
-         holding an active directory role assignment.
+         holding an active directory role assignment; a 403 on the write is also recorded as a skip, not an error, because
+         Graph protects some accounts (role-assignable group members) that this runbook cannot see in advance.
+         When a user is unstamped and their mobilePhone is a number that now belongs to another in-scope user's phone
+         (phone handover), the old holder's mobilePhone is cleared so two people never share a number in the directory.
+      4b. Safety rail: no unstamping when Intune returned zero iPhones, and no more than 25 percent of the stamped
+         population in one run unless -AllowMassUnstamp is $true.
       5. Emit one log line per change and a summary object. Throw at the end if any error occurred so the job shows Failed.
 
     This runbook never calls the Entra authentication methods API. mobilePhone is a profile attribute only.
@@ -42,6 +48,10 @@
 .PARAMETER ScopeAttributeValue
     Value written to extensionAttribute1 for in-scope users. Default 'CorpiPhone'. Must match the dynamic group rule
     and the Exchange management scope filter.
+.PARAMETER AllowMassUnstamp
+    Safety rail. The runbook refuses to clear the stamp from more than 25 percent (minimum 3) of currently stamped users
+    in one run, and refuses to unstamp anyone when Intune returned zero corporate iPhones, because that pattern means a
+    broken read rather than a real change. Set $true for one run to confirm a genuine mass change (large offboarding).
 
 .OUTPUTS
     Log lines (strings) followed by one summary [pscustomobject].
@@ -55,7 +65,8 @@ param(
     [bool]$WhatIf = $true,
     [string]$ExclusionGroupName = 'SG-Directory-Exclude',
     [string]$DefaultCountryCode = '+1',
-    [string]$ScopeAttributeValue = 'CorpiPhone'
+    [string]$ScopeAttributeValue = 'CorpiPhone',
+    [bool]$AllowMassUnstamp = $false
 )
 
 Set-StrictMode -Version Latest
@@ -124,21 +135,24 @@ function Invoke-GraphRequestWithRetry {
         [Parameter(Mandatory)] [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')] [string]$Method,
         [Parameter(Mandatory)] [string]$Uri,
         [string]$Body,
+        [hashtable]$Headers,
         [int]$MaxAttempts = 6
     )
     $attempt = 0
     while ($true) {
         $attempt++
         try {
-            if ($Method -in @('POST', 'PATCH') -and $null -ne $Body) {
-                return Invoke-MgGraphRequest -Method $Method -Uri $Uri -Body $Body -ContentType 'application/json'
-            }
-            return Invoke-MgGraphRequest -Method $Method -Uri $Uri
+            $call = @{ Method = $Method; Uri = $Uri }
+            if ($null -ne $Headers -and $Headers.Count -gt 0) { $call.Headers = $Headers }
+            if ($Method -in @('POST', 'PATCH') -and $null -ne $Body) { $call.Body = $Body; $call.ContentType = 'application/json' }
+            return Invoke-MgGraphRequest @call
         }
         catch {
             $status = Get-HttpStatusCode -ErrorRecord $_
             if ($status -in @(429, 503, 504) -and $attempt -lt $MaxAttempts) {
                 $delay = [Math]::Min(60, [Math]::Pow(2, $attempt)) + (Get-Random -Minimum 0 -Maximum 3)
+                $retryAfter = Get-RetryAfterFromError -ErrorRecord $_
+                if ($retryAfter -gt $delay) { $delay = $retryAfter }
                 Write-SyncLog -Level WARN -Message "Graph $Method $Uri returned $status, retrying in $delay s (attempt $attempt of $MaxAttempts)"
                 Start-Sleep -Seconds $delay
                 continue
@@ -148,13 +162,27 @@ function Invoke-GraphRequestWithRetry {
     }
 }
 
+function Get-RetryAfterFromError {
+    <# Best-effort read of a Retry-After header (seconds) off a Graph error record; 0 when absent. #>
+    param([Parameter(Mandatory)] [System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $resp = Get-Field -Object $ErrorRecord.Exception -Name 'Response'
+    $headers = Get-Field -Object $resp -Name 'Headers'
+    $ra = Get-Field -Object $headers -Name 'RetryAfter'
+    if ($null -eq $ra) { return 0 }
+    $delta = Get-Field -Object $ra -Name 'Delta'
+    if ($null -ne $delta) { return [int][Math]::Min(120, [Math]::Max(0, ([TimeSpan]$delta).TotalSeconds)) }
+    $date = Get-Field -Object $ra -Name 'Date'
+    if ($null -ne $date) { return [int][Math]::Min(120, [Math]::Max(0, (([DateTimeOffset]$date) - [DateTimeOffset]::UtcNow).TotalSeconds)) }
+    return 0
+}
+
 function Get-GraphCollection {
-    <# GET with @odata.nextLink paging. Returns an array of items (hashtables). #>
-    param([Parameter(Mandatory)] [string]$Uri)
+    <# GET with @odata.nextLink paging. Returns an array of items (hashtables). Headers are re-sent on every page. #>
+    param([Parameter(Mandatory)] [string]$Uri, [hashtable]$Headers)
     $items = [System.Collections.Generic.List[object]]::new()
     $next = $Uri
     while ($next) {
-        $page = Invoke-GraphRequestWithRetry -Method GET -Uri $next
+        $page = Invoke-GraphRequestWithRetry -Method GET -Uri $next -Headers $Headers
         $value = Get-Field -Object $page -Name 'value'
         if ($null -ne $value) { foreach ($v in $value) { $items.Add($v) } }
         $next = Get-Field -Object $page -Name '@odata.nextLink'
@@ -199,7 +227,10 @@ function ConvertTo-DeviceRecord {
     $sync = Get-Field -Object $Device -Name 'lastSyncDateTime'
     if ($null -eq $sync) { $sync = Get-Field -Object $Device -Name 'LastSyncDateTime' }
     $syncDate = [DateTime]::MinValue
-    if ($null -ne $sync -and -not [string]::IsNullOrWhiteSpace([string]$sync)) {
+    if ($sync -is [DateTime]) { $syncDate = $sync.ToUniversalTime() }
+    elseif ($sync -is [DateTimeOffset]) { $syncDate = $sync.UtcDateTime }
+    elseif ($null -ne $sync -and -not [string]::IsNullOrWhiteSpace([string]$sync)) {
+        # Only strings are parsed, always with the invariant culture, so the runbook behaves the same in every sandbox locale.
         try { $syncDate = [DateTime]::Parse([string]$sync, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) } catch { $syncDate = [DateTime]::MinValue }
     }
     $pick = {
@@ -217,7 +248,23 @@ function ConvertTo-DeviceRecord {
         LastSyncDateTime  = $syncDate
         DeviceName        = & $pick 'deviceName' 'DeviceName'
         SerialNumber      = & $pick 'serialNumber' 'SerialNumber'
+        Model             = & $pick 'model' 'Model'
+        OperatingSystem   = & $pick 'operatingSystem' 'OperatingSystem'
+        OwnerType         = & $pick 'managedDeviceOwnerType' 'ManagedDeviceOwnerType'
     }
+}
+
+function Test-IsCorporateIPhone {
+    <#
+        True when a device record is a company-owned iPhone. The Intune filter already asks for iOS + company, but this re-checks
+        client-side (the filter properties are not documented as filterable) and drops iPads, whose cellular data SIM must never
+        become somebody's mobile number.
+    #>
+    param([Parameter(Mandatory)] [object]$Device)
+    if ($Device.OperatingSystem -and $Device.OperatingSystem -notmatch '^iOS$|^iPadOS$') { return $false }
+    if ($Device.OwnerType -and $Device.OwnerType -ne 'company') { return $false }
+    if ([string]::IsNullOrWhiteSpace($Device.Model)) { return $true }   # older inventory without a model: keep, cannot prove otherwise
+    return ($Device.Model -match '^iPhone')
 }
 
 function Select-NewestDevicePerUser {
@@ -273,7 +320,7 @@ function Resolve-StampChanges {
     #>
     param(
         [AllowEmptyCollection()] [object[]]$Users,
-        [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$InScopeUserIds,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.Generic.HashSet[string]]$InScopeUserIds,
         [Parameter(Mandatory)] [string]$ScopeAttributeValue
     )
     $toStamp = [System.Collections.Generic.List[object]]::new()
@@ -310,8 +357,10 @@ function Set-UserScopeAttribute {
 }
 
 function Set-UserMobilePhone {
-    param([Parameter(Mandatory)] [string]$UserId, [Parameter(Mandatory)] [string]$MobilePhone)
-    $body = @{ mobilePhone = $MobilePhone } | ConvertTo-Json -Compress
+    <# PATCHes mobilePhone. An empty or null value clears it (JSON null). #>
+    param([Parameter(Mandatory)] [string]$UserId, [AllowNull()] [AllowEmptyString()] [string]$MobilePhone)
+    $jsonValue = if ([string]::IsNullOrEmpty($MobilePhone)) { $null } else { $MobilePhone }
+    $body = @{ mobilePhone = $jsonValue } | ConvertTo-Json -Compress
     $null = Invoke-GraphRequestWithRetry -Method PATCH -Uri "$GraphBase/users/$UserId" -Body $body
 }
 
@@ -326,7 +375,8 @@ function Get-GroupIdByName {
 
 function Get-GroupTransitiveUserIds {
     param([Parameter(Mandatory)] [string]$GroupId)
-    $members = @(Get-GraphCollection -Uri "$GraphBase/groups/$GroupId/transitiveMembers/microsoft.graph.user?`$select=id&`$top=999")
+    # The OData cast is an advanced query: send ConsistencyLevel eventual and $count=true as Microsoft Learn documents.
+    $members = @(Get-GraphCollection -Uri "$GraphBase/groups/$GroupId/transitiveMembers/microsoft.graph.user?`$select=id&`$count=true&`$top=999" -Headers @{ ConsistencyLevel = 'eventual' })
     $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($m in $members) {
         $id = Get-Field -Object $m -Name 'id'
@@ -373,6 +423,7 @@ $summary = [ordered]@{
     UsersStamped     = 0
     UsersUnstamped   = 0
     NumbersUpdated   = 0
+    NumbersCleared   = 0
     NumbersUnchanged = 0
     UsersSkipped     = [ordered]@{}
     Errors           = 0
@@ -387,14 +438,20 @@ function Add-Skip {
 }
 
 function Add-Error {
-    param([Parameter(Mandatory)] [string]$Message)
+    param([Parameter(Mandatory)] [string]$Message, [System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $text = $Message
+    if ($null -ne $ErrorRecord) {
+        # Graph puts its error code and message (Authorization_RequestDenied, Request_ResourceNotFound, ...) in ErrorDetails.
+        $details = Get-Field -Object $ErrorRecord.ErrorDetails -Name 'Message'
+        $text = "$Message : $($ErrorRecord.Exception.Message)$(if ($details) { " $details" })"
+    }
     $summary.Errors++
-    $errorMessages.Add($Message)
-    Write-SyncLog -Level ERROR -Message $Message
+    $errorMessages.Add($text)
+    Write-SyncLog -Level ERROR -Message $text
 }
 
 $mode = if ($WhatIf) { 'WHATIF' } else { 'APPLY' }
-Write-SyncLog "Sync-IntuneToEntra starting. Mode=$mode ScopeAttribute=$ScopeAttributeName=$ScopeAttributeValue ExclusionGroup='$ExclusionGroupName' DefaultCountryCode=$DefaultCountryCode"
+Write-SyncLog "Sync-IntuneToEntra starting. Mode=$mode ScopeAttribute=$ScopeAttributeName=$ScopeAttributeValue ExclusionGroup='$ExclusionGroupName' DefaultCountryCode=$DefaultCountryCode AllowMassUnstamp=$AllowMassUnstamp"
 
 # --- connect -------------------------------------------------------------------------------------------------------
 foreach ($m in $RequiredModules) { Import-Module -Name $m -ErrorAction Stop }
@@ -406,35 +463,40 @@ Write-SyncLog "Connected to Graph as managed identity (client $($ctx.ClientId)) 
 # --- 1. devices ------------------------------------------------------------------------------------------------------
 $rawDevices = @(Get-MgDeviceManagementManagedDevice -All -PageSize 999 `
         -Filter "operatingSystem eq 'iOS' and managedDeviceOwnerType eq 'company'" `
-        -Property Id, UserId, UserPrincipalName, PhoneNumber, LastSyncDateTime, DeviceName, SerialNumber)
-$devices = @($rawDevices | ForEach-Object { ConvertTo-DeviceRecord -Device $_ })
-$summary.DevicesRead = $devices.Count
+        -Property Id, UserId, UserPrincipalName, PhoneNumber, LastSyncDateTime, DeviceName, SerialNumber, Model, OperatingSystem, ManagedDeviceOwnerType)
+$allDevices = @($rawDevices | ForEach-Object { ConvertTo-DeviceRecord -Device $_ })
+$summary.DevicesRead = $allDevices.Count
+$devices = [System.Collections.Generic.List[object]]::new()
+foreach ($d in $allDevices) {
+    if (Test-IsCorporateIPhone -Device $d) { $devices.Add($d) }
+    else { Add-Skip -Reason 'NotACorporateIPhone' -Detail "device '$($d.DeviceName)' serial $($d.SerialNumber) model '$($d.Model)' os '$($d.OperatingSystem)' ownership '$($d.OwnerType)' is ignored (primary user $($d.UserPrincipalName))" }
+}
 $withUser = @($devices | Where-Object { -not [string]::IsNullOrWhiteSpace($_.UserId) })
 $summary.DevicesWithoutPrimaryUser = $devices.Count - $withUser.Count
 foreach ($d in ($devices | Where-Object { [string]::IsNullOrWhiteSpace($_.UserId) })) {
-    Write-SyncLog -Level WARN -Message "Device '$($d.DeviceName)' serial $($d.SerialNumber) has no primary user and is ignored. Set the primary user in Intune."
+    Add-Skip -Reason 'DeviceNoPrimaryUser' -Detail "device '$($d.DeviceName)' serial $($d.SerialNumber) has no primary user and is ignored. Set the primary user in Intune."
 }
-Write-SyncLog "Read $($devices.Count) corporate iOS devices, $($withUser.Count) with a primary user"
+Write-SyncLog "Read $($allDevices.Count) corporate iOS devices: $($devices.Count) iPhones, $($withUser.Count) with a primary user"
 
 # --- 2. users --------------------------------------------------------------------------------------------------------
-$rawUsers = @(Get-MgUser -All -PageSize 999 -ConsistencyLevel eventual -CountVariable memberCount `
-        -Filter "userType eq 'Member'" `
-        -Property Id, UserPrincipalName, AccountEnabled, MobilePhone, OnPremisesExtensionAttributes)
-$users = @($rawUsers | ForEach-Object { ConvertTo-UserRecord -User $_ -AttributeName $ScopeAttributeName })
+# All users are read and guests dropped client-side: a userType filter would miss older accounts whose userType is null.
+$rawUsers = @(Get-MgUser -All -PageSize 999 -Property Id, UserPrincipalName, AccountEnabled, MobilePhone, UserType, OnPremisesExtensionAttributes)
+$users = @($rawUsers | Where-Object { [string](Get-Field -Object $_ -Name 'UserType') -ne 'Guest' } | ForEach-Object { ConvertTo-UserRecord -User $_ -AttributeName $ScopeAttributeName })
 $userById = @{}
 foreach ($u in $users) { $userById[$u.Id.ToLowerInvariant()] = $u }
 $knownUserIds = [System.Collections.Generic.HashSet[string]]::new([string[]]$userById.Keys, [StringComparer]::OrdinalIgnoreCase)
-Write-SyncLog "Read $($users.Count) member users"
+Write-SyncLog "Read $($users.Count) member users ($($rawUsers.Count - $users.Count) guests ignored)"
 
 $inScopeIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$skippedUserKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($d in $withUser) {
     $key = $d.UserId.ToLowerInvariant()
     if (-not $userById.ContainsKey($key)) {
-        Add-Skip -Reason 'DeviceUserNotMember' -Detail "device '$($d.DeviceName)' serial $($d.SerialNumber) primary user $($d.UserPrincipalName) ($($d.UserId)) is not a member user"
+        if ($skippedUserKeys.Add($key)) { Add-Skip -Reason 'DeviceUserNotMember' -Detail "primary user $($d.UserPrincipalName) ($($d.UserId)) of device '$($d.DeviceName)' serial $($d.SerialNumber) is not a member user (guest or deleted)" }
         continue
     }
     if (-not $userById[$key].AccountEnabled) {
-        Add-Skip -Reason 'DeviceUserDisabled' -Detail "device '$($d.DeviceName)' serial $($d.SerialNumber) primary user $($d.UserPrincipalName) is disabled"
+        if ($skippedUserKeys.Add($key)) { Add-Skip -Reason 'DeviceUserDisabled' -Detail "primary user $($d.UserPrincipalName) of device '$($d.DeviceName)' serial $($d.SerialNumber) is disabled" }
         continue
     }
     $null = $inScopeIds.Add($key)
@@ -442,7 +504,7 @@ foreach ($d in $withUser) {
 $summary.UsersInScope = $inScopeIds.Count
 Write-SyncLog "In-scope users (enabled primary users of corporate iPhones): $($inScopeIds.Count)"
 
-# --- 3. exclusions for the phone write (resolved before any write so a missing group fails the job cleanly) ---------------------------------------------------------------------------------
+# --- 3. exclusions and privileged users (resolved before any write so a missing group fails the job cleanly) -----------------------
 $excludedIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 if (-not [string]::IsNullOrWhiteSpace($ExclusionGroupName)) {
     $exclusionGroupId = Get-GroupIdByName -DisplayName $ExclusionGroupName
@@ -455,6 +517,16 @@ if (-not [string]::IsNullOrWhiteSpace($ExclusionGroupName)) {
 $privilegedIds = Get-PrivilegedUserIds -KnownUserIds $knownUserIds
 Write-SyncLog "Users holding an active directory role assignment: $($privilegedIds.Count)"
 
+# Numbers as this run attributes them (normalized number -> user key), needed by the handover check in the unstamp pass.
+$newestByUser = Select-NewestDevicePerUser -Devices $withUser
+$numberOwner = @{}
+foreach ($key in $inScopeIds) {
+    $d = $newestByUser[$key]
+    if ($null -eq $d -or [string]::IsNullOrWhiteSpace($d.PhoneNumber)) { continue }
+    $n = ConvertTo-E164 -Number $d.PhoneNumber -DefaultCountryCode $DefaultCountryCode
+    if ($n -and -not $numberOwner.ContainsKey($n)) { $numberOwner[$n] = $key }
+}
+
 # --- 4. stamp --------------------------------------------------------------------------------------------------------
 $plan = Resolve-StampChanges -Users $users -InScopeUserIds $inScopeIds -ScopeAttributeValue $ScopeAttributeValue
 if ($plan.Conflicts.Count -gt 0) {
@@ -464,13 +536,27 @@ if ($plan.Conflicts.Count -gt 0) {
     throw "$($plan.Conflicts.Count) user(s) carry a foreign value in $ScopeAttributeName. This runbook owns that attribute and will not overwrite it. Clear the attribute or choose another one (see README). No changes were made."
 }
 
+# Circuit breaker: a short or empty Intune read must never strip the whole population of its stamp (and with it the group,
+# the Outlook policies and the Exchange scope). Report what would happen, then stop before any write.
+$currentlyStamped = @($users | Where-Object { $_.ScopeAttribute -eq $ScopeAttributeValue }).Count
+$unstampLimit = [Math]::Max(3, [Math]::Ceiling($currentlyStamped * 0.25))
+if ($plan.ToUnstamp.Count -gt 0 -and -not $AllowMassUnstamp) {
+    $reason = $null
+    if ($devices.Count -eq 0) { $reason = "Intune returned zero corporate iPhones" }
+    elseif ($plan.ToUnstamp.Count -gt $unstampLimit) { $reason = "$($plan.ToUnstamp.Count) of $currentlyStamped stamped users would be unstamped (limit $unstampLimit)" }
+    if ($reason) {
+        foreach ($u in $plan.ToUnstamp) { Write-SyncLog -Level CHANGE -Message "WOULD UNSTAMP $($u.UserPrincipalName)" }
+        throw "Mass unstamp refused: $reason. This looks like a broken device read, not a real change. If it is real, run once with AllowMassUnstamp = true. No changes were made."
+    }
+}
+
 foreach ($u in $plan.ToStamp) {
     try {
         if (-not $WhatIf) { Set-UserScopeAttribute -UserId $u.Id -AttributeName $ScopeAttributeName -Value $ScopeAttributeValue }
         $summary.UsersStamped++
         Write-SyncLog -Level CHANGE -Message "$mode STAMP   $($u.UserPrincipalName) $ScopeAttributeName '' -> '$ScopeAttributeValue'"
     }
-    catch { Add-Error "Stamp failed for $($u.UserPrincipalName): $($_.Exception.Message)" }
+    catch { Add-Error -Message "Stamp failed for $($u.UserPrincipalName)" -ErrorRecord $_ }
 }
 foreach ($u in $plan.ToUnstamp) {
     try {
@@ -479,12 +565,25 @@ foreach ($u in $plan.ToUnstamp) {
         $why = if (-not $u.AccountEnabled) { 'account disabled' } else { 'no longer primary user of a corporate iPhone' }
         Write-SyncLog -Level CHANGE -Message "$mode UNSTAMP $($u.UserPrincipalName) $ScopeAttributeName '$ScopeAttributeValue' -> '' ($why)"
     }
-    catch { Add-Error "Unstamp failed for $($u.UserPrincipalName): $($_.Exception.Message)" }
+    catch { Add-Error -Message "Unstamp failed for $($u.UserPrincipalName)" -ErrorRecord $_ }
+    # Phone handover: the number this user carries now belongs to another in-scope user's phone. Clear it so the directory
+    # never lists two people with one number. Numbers that moved nowhere are left alone (the user may still own that SIM).
+    if ($u.MobilePhone -and $numberOwner.ContainsKey($u.MobilePhone) -and $numberOwner[$u.MobilePhone] -ne $u.Id.ToLowerInvariant()) {
+        try {
+            if (-not $WhatIf) { Set-UserMobilePhone -UserId $u.Id -MobilePhone $null }
+            $summary.NumbersCleared++
+            Write-SyncLog -Level CHANGE -Message "$mode PHONE   $($u.UserPrincipalName) mobilePhone $($u.MobilePhone) -> (none) (number now belongs to $($userById[$numberOwner[$u.MobilePhone]].UserPrincipalName))"
+        }
+        catch {
+            $status = Get-HttpStatusCode -ErrorRecord $_
+            if ($status -eq 403) { Add-Skip -Reason 'PhoneWriteForbidden' -Detail "$($u.UserPrincipalName) : Graph refused to clear mobilePhone (protected account). Clear it by hand." }
+            else { Add-Error -Message "mobilePhone clear failed for $($u.UserPrincipalName)" -ErrorRecord $_ }
+        }
+    }
 }
 Write-SyncLog "Stamp pass done: $($summary.UsersStamped) stamped, $($summary.UsersUnstamped) unstamped"
 
 # --- 5. phone numbers ---------------------------------------------------------------------------------------------------
-$newestByUser = Select-NewestDevicePerUser -Devices $withUser
 foreach ($key in ($inScopeIds | Sort-Object)) {
     $u = $userById[$key]
     $d = $newestByUser[$key]
@@ -498,12 +597,14 @@ foreach ($key in ($inScopeIds | Sort-Object)) {
         Add-Skip -Reason 'InvalidPhoneNumber' -Detail "$($u.UserPrincipalName) device serial $($d.SerialNumber) reports '$($d.PhoneNumber)', which does not normalize to E.164"
         continue
     }
+    # Numbers of excluded and privileged users are deliberately NOT written to the log either: withholding them from Entra
+    # would mean little if anyone with job-history access could read them here.
     if ($excludedIds.Contains($key)) {
-        Add-Skip -Reason 'ExcludedGroupMember' -Detail "$($u.UserPrincipalName) is a member of '$ExclusionGroupName'; number $normalized not written (stamp kept)"
+        Add-Skip -Reason 'ExcludedGroupMember' -Detail "$($u.UserPrincipalName) is a member of '$ExclusionGroupName'; number not written (stamp kept)"
         continue
     }
     if ($privilegedIds.Contains($key)) {
-        Add-Skip -Reason 'PrivilegedRole' -Detail "$($u.UserPrincipalName) holds an active directory role; number $normalized not written (stamp kept). Set it by hand if wanted."
+        Add-Skip -Reason 'PrivilegedRole' -Detail "$($u.UserPrincipalName) holds an active directory role; number not written (stamp kept). Set it by hand if wanted."
         continue
     }
     if ($u.MobilePhone -eq $normalized) { $summary.NumbersUnchanged++; continue }
@@ -513,11 +614,19 @@ foreach ($key in ($inScopeIds | Sort-Object)) {
         $old = if ($u.MobilePhone) { $u.MobilePhone } else { '(none)' }
         Write-SyncLog -Level CHANGE -Message "$mode PHONE   $($u.UserPrincipalName) mobilePhone $old -> $normalized (device '$($d.DeviceName)' serial $($d.SerialNumber), raw '$($d.PhoneNumber)')"
     }
-    catch { Add-Error "mobilePhone write failed for $($u.UserPrincipalName): $($_.Exception.Message)" }
+    catch {
+        $status = Get-HttpStatusCode -ErrorRecord $_
+        if ($status -eq 403) {
+            # Graph protects some accounts (members or owners of role-assignable groups, some admin units) from app-only
+            # writes without listing them in roleAssignments. Record it as a skip, keep the stamp, do not fail the job.
+            Add-Skip -Reason 'PhoneWriteForbidden' -Detail "$($u.UserPrincipalName) : Graph refused the mobilePhone write (protected account). Set the number by hand or add the user to '$ExclusionGroupName'."
+        }
+        else { Add-Error -Message "mobilePhone write failed for $($u.UserPrincipalName)" -ErrorRecord $_ }
+    }
 }
 
 # --- 6. summary ----------------------------------------------------------------------------------------------------------
-Write-SyncLog "Sync-IntuneToEntra finished. Devices=$($summary.DevicesRead) InScope=$($summary.UsersInScope) Stamped=$($summary.UsersStamped) Unstamped=$($summary.UsersUnstamped) NumbersUpdated=$($summary.NumbersUpdated) Unchanged=$($summary.NumbersUnchanged) Skipped=$(($summary.UsersSkipped.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') Errors=$($summary.Errors)"
+Write-SyncLog "Sync-IntuneToEntra finished. Devices=$($summary.DevicesRead) InScope=$($summary.UsersInScope) Stamped=$($summary.UsersStamped) Unstamped=$($summary.UsersUnstamped) NumbersUpdated=$($summary.NumbersUpdated) NumbersCleared=$($summary.NumbersCleared) Unchanged=$($summary.NumbersUnchanged) Skipped=$(($summary.UsersSkipped.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') Errors=$($summary.Errors)"
 [pscustomobject]$summary
 
 if ($summary.Errors -gt 0) {

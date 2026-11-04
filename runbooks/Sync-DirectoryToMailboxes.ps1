@@ -132,16 +132,17 @@ function Invoke-GraphRequestWithRetry {
         [Parameter(Mandatory)] [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')] [string]$Method,
         [Parameter(Mandatory)] [string]$Uri,
         [string]$Body,
+        [hashtable]$Headers,
         [int]$MaxAttempts = 6
     )
     $attempt = 0
     while ($true) {
         $attempt++
         try {
-            if ($Method -in @('POST', 'PATCH') -and $null -ne $Body) {
-                return Invoke-MgGraphRequest -Method $Method -Uri $Uri -Body $Body -ContentType 'application/json'
-            }
-            return Invoke-MgGraphRequest -Method $Method -Uri $Uri
+            $call = @{ Method = $Method; Uri = $Uri }
+            if ($null -ne $Headers -and $Headers.Count -gt 0) { $call.Headers = $Headers }
+            if ($Method -in @('POST', 'PATCH') -and $null -ne $Body) { $call.Body = $Body; $call.ContentType = 'application/json' }
+            return Invoke-MgGraphRequest @call
         }
         catch {
             $status = Get-HttpStatusCode -ErrorRecord $_
@@ -157,11 +158,11 @@ function Invoke-GraphRequestWithRetry {
 }
 
 function Get-GraphCollection {
-    param([Parameter(Mandatory)] [string]$Uri)
+    param([Parameter(Mandatory)] [string]$Uri, [hashtable]$Headers)
     $items = [System.Collections.Generic.List[object]]::new()
     $next = $Uri
     while ($next) {
-        $page = Invoke-GraphRequestWithRetry -Method GET -Uri $next
+        $page = Invoke-GraphRequestWithRetry -Method GET -Uri $next -Headers $Headers
         $value = Get-Field -Object $page -Name 'value'
         if ($null -ne $value) { foreach ($v in $value) { $items.Add($v) } }
         $next = Get-Field -Object $page -Name '@odata.nextLink'
@@ -506,7 +507,8 @@ Write-SyncLog "Connected to Graph as managed identity (client $($ctx.ClientId)) 
 $groupId = Get-GroupIdByName -DisplayName $GroupName
 if (-not $groupId) { throw "Control group '$GroupName' was not found." }
 $select = 'id,userPrincipalName,accountEnabled,displayName,givenName,surname,jobTitle,department,companyName,mobilePhone,businessPhones,mail,officeLocation'
-$rawMembers = @(Get-GraphCollection -Uri "$GraphBase/groups/$groupId/transitiveMembers/microsoft.graph.user?`$select=$select&`$top=999")
+# The OData cast is an advanced query: ConsistencyLevel eventual and $count=true, as Microsoft Learn documents.
+$rawMembers = @(Get-GraphCollection -Uri "$GraphBase/groups/$groupId/transitiveMembers/microsoft.graph.user?`$select=$select&`$count=true&`$top=999" -Headers @{ ConsistencyLevel = 'eventual' })
 $members = @($rawMembers | ForEach-Object { ConvertTo-DirectoryUserRecord -User $_ })
 Write-SyncLog "Control group '$GroupName' has $($members.Count) user members"
 
@@ -514,7 +516,7 @@ $excludedIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer
 if (-not [string]::IsNullOrWhiteSpace($ExclusionGroupName)) {
     $exclusionGroupId = Get-GroupIdByName -DisplayName $ExclusionGroupName
     if (-not $exclusionGroupId) { throw "Exclusion group '$ExclusionGroupName' was not found. Create it or pass an empty -ExclusionGroupName." }
-    $exMembers = @(Get-GraphCollection -Uri "$GraphBase/groups/$exclusionGroupId/transitiveMembers/microsoft.graph.user?`$select=id&`$top=999")
+    $exMembers = @(Get-GraphCollection -Uri "$GraphBase/groups/$exclusionGroupId/transitiveMembers/microsoft.graph.user?`$select=id&`$count=true&`$top=999" -Headers @{ ConsistencyLevel = 'eventual' })
     foreach ($m in $exMembers) { $id = Get-Field -Object $m -Name 'id'; if ($id) { $null = $excludedIds.Add([string]$id) } }
     Write-SyncLog "Exclusion group '$ExclusionGroupName' has $($excludedIds.Count) user members (they receive contacts but are not listed)"
 }
